@@ -1,0 +1,39 @@
+version: "3.8"
+
+services:
+  lethe:
+    image: ghcr.io/openlethe/lethe:0.3.0
+    environment:
+      LETHE_API_KEY: ${LETHE_API_KEY}
+    volumes:
+      - ./lethe-data:/data
+    networks:
+      - styx
+    restart: unless-stopped
+
+  charon:
+    build: .
+    environment:
+      CHARON_MODE: direct
+      CHARON_HTTP: ":18484"
+      CHARON_ADMIN_HTTP: "127.0.0.1:18486"
+      CHARON_UPSTREAM: http://lethe:18483
+      CHARON_PUBLIC_URL: ${CHARON_PUBLIC_URL:-http://localhost:18484}
+      LETHE_API_KEY: ${LETHE_API_KEY}
+      CHARON_HMAC_KEY: ${CHARON_HMAC_KEY}
+      CHARON_DATA_DIR: /data
+    volumes:
+      - ./charon-data:/data
+    networks:
+      - styx
+      - edge
+    ports:
+      - "18484:18484"
+    restart: unless-stopped
+    depends_on:
+      - lethe
+
+networks:
+  styx:
+    internal: true
+  edge: {}
