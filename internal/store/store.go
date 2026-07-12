@@ -145,7 +145,7 @@ func (db *DB) migrateV1() error {
 			entry_hash BLOB NOT NULL
 		)`,
 		`CREATE INDEX idx_obols_principal ON obols(principal_id)`,
-		`CREATE INDEX idx_ledger_request ON ledger_entries(request_id)`,
+		`CREATE UNIQUE INDEX idx_idempotency ON idempotency_records(principal_id, operation, idempotency_key)`,
 	}
 
 	for _, stmt := range statements {

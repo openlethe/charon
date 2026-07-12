@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -131,7 +132,36 @@ func (s *Server) registerTools() {
 	s.mcpServer.AddTool(writeTool, s.handleWrite)
 }
 
-// ... existing handlers ...
+// checkIdempotency handles the idempotency check with race-condition protection.
+// If the key exists with matching input, returns the existing record.
+// If the key exists with different input, returns an error.
+func (s *Server) checkIdempotency(ctx context.Context, principalID, operation, key string, args map[string]interface{}) (*idempotency.Record, error) {
+	check, err := s.idempotency.Check(ctx, principalID, operation, key, args)
+	if err != nil {
+		return nil, fmt.Errorf("idempotency check failed: %w", err)
+	}
+	if check.Found {
+		if !check.Matching {
+			return nil, fmt.Errorf("idempotency key exists with different input")
+		}
+		return check.Record, nil
+	}
+	return nil, nil // not found
+}
+
+// storeIdempotency stores the idempotency record, handling concurrent races.
+// If another request already stored the key, it re-checks and returns the existing record.
+func (s *Server) storeIdempotency(ctx context.Context, principalID, operation, key string, args map[string]interface{}, status, resourceID string) (*idempotency.Record, error) {
+	err := s.idempotency.Store(ctx, principalID, operation, key, args, status, resourceID, "")
+	if err == nil {
+		return nil, nil // stored successfully
+	}
+	if err == idempotency.ErrDuplicateKey {
+		// Lost the race - another request stored it first. Re-check.
+		return s.checkIdempotency(ctx, principalID, operation, key, args)
+	}
+	return nil, fmt.Errorf("store idempotency failed: %w", err)
+}
 
 func (s *Server) handlePropose(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	start := time.Now()
@@ -156,20 +186,17 @@ func (s *Server) handlePropose(ctx context.Context, request mcp.CallToolRequest)
 	}
 
 	// Check idempotency
-	check, err := s.idempotency.Check(ctx, principal.ID, "memory_propose", idempotencyKey, args)
+	existing, err := s.checkIdempotency(ctx, principal.ID, "memory_propose", idempotencyKey, args)
 	if err != nil {
-		return nil, fmt.Errorf("idempotency check failed: %w", err)
+		return nil, err
 	}
-	if check.Found {
-		if !check.Matching {
-			return nil, fmt.Errorf("idempotency key exists with different input")
-		}
+	if existing != nil {
 		// Return existing proposal
-		existing, err := s.proposalSvc.FindByIdempotency(ctx, principal.ID, idempotencyKey)
+		found, err := s.proposalSvc.FindByIdempotency(ctx, principal.ID, idempotencyKey)
 		if err != nil {
 			return nil, fmt.Errorf("find existing: %w", err)
 		}
-		data, _ := json.MarshalIndent(map[string]interface{}{"proposal_id": existing.ID, "status": existing.Status, "existing": true}, "", "  ")
+		data, _ := json.MarshalIndent(map[string]interface{}{"proposal_id": found.ID, "status": found.Status, "existing": true}, "", "  ")
 		return mcp.NewToolResultText(string(data)), nil
 	}
 
@@ -210,12 +237,20 @@ func (s *Server) handlePropose(ctx context.Context, request mcp.CallToolRequest)
 
 	p, err := s.proposalSvc.Create(ctx, createReq)
 	if err != nil {
-		s.recordLedger(reqID, principal, "memory_propose", []string{project}, "error: "+err.Error(), time.Since(start))
+		s.recordLedger(reqID, principal, "memory_propose", []string{project}, "error: "+sanitizeError(err), time.Since(start))
 		return nil, fmt.Errorf("create proposal failed: %w", err)
 	}
 
 	// Store idempotency record
-	_ = s.idempotency.Store(ctx, principal.ID, "memory_propose", idempotencyKey, args, "pending", p.ID, "")
+	existingIdem, err := s.storeIdempotency(ctx, principal.ID, "memory_propose", idempotencyKey, args, "pending", p.ID)
+	if err != nil {
+		return nil, err
+	}
+	if existingIdem != nil {
+		// Lost the race - return the winner's result
+		data, _ := json.MarshalIndent(map[string]interface{}{"proposal_id": existingIdem.ResultingResourceID, "status": "pending", "existing": true}, "", "  ")
+		return mcp.NewToolResultText(string(data)), nil
+	}
 
 	data, _ := json.MarshalIndent(map[string]interface{}{"proposal_id": p.ID, "status": p.Status}, "", "  ")
 	s.recordLedger(reqID, principal, "memory_propose", []string{project}, "success", time.Since(start))
@@ -245,19 +280,16 @@ func (s *Server) handleCheckpoint(ctx context.Context, request mcp.CallToolReque
 	}
 
 	// Check idempotency
-	check, err := s.idempotency.Check(ctx, principal.ID, "memory_checkpoint", idempotencyKey, args)
+	existing, err := s.checkIdempotency(ctx, principal.ID, "memory_checkpoint", idempotencyKey, args)
 	if err != nil {
-		return nil, fmt.Errorf("idempotency check failed: %w", err)
+		return nil, err
 	}
-	if check.Found {
-		if !check.Matching {
-			return nil, fmt.Errorf("idempotency key exists with different input")
-		}
-		existing, err := s.proposalSvc.FindByIdempotency(ctx, principal.ID, idempotencyKey)
+	if existing != nil {
+		found, err := s.proposalSvc.FindByIdempotency(ctx, principal.ID, idempotencyKey)
 		if err != nil {
 			return nil, fmt.Errorf("find existing: %w", err)
 		}
-		data, _ := json.MarshalIndent(map[string]interface{}{"proposal_id": existing.ID, "status": existing.Status, "existing": true}, "", "  ")
+		data, _ := json.MarshalIndent(map[string]interface{}{"proposal_id": found.ID, "status": found.Status, "existing": true}, "", "  ")
 		return mcp.NewToolResultText(string(data)), nil
 	}
 
@@ -292,11 +324,20 @@ func (s *Server) handleCheckpoint(ctx context.Context, request mcp.CallToolReque
 
 	p, err := s.proposalSvc.Create(ctx, createReq)
 	if err != nil {
-		s.recordLedger(reqID, principal, "memory_checkpoint", []string{project}, "error: "+err.Error(), time.Since(start))
+		s.recordLedger(reqID, principal, "memory_checkpoint", []string{project}, "error: "+sanitizeError(err), time.Since(start))
 		return nil, fmt.Errorf("create checkpoint failed: %w", err)
 	}
 
-	_ = s.idempotency.Store(ctx, principal.ID, "memory_checkpoint", idempotencyKey, args, "pending", p.ID, "")
+	// Store idempotency record
+	existingIdem, err := s.storeIdempotency(ctx, principal.ID, "memory_checkpoint", idempotencyKey, args, "pending", p.ID)
+	if err != nil {
+		return nil, err
+	}
+	if existingIdem != nil {
+		// Lost the race - return the winner's result
+		data, _ := json.MarshalIndent(map[string]interface{}{"proposal_id": existingIdem.ResultingResourceID, "status": "pending", "existing": true}, "", "  ")
+		return mcp.NewToolResultText(string(data)), nil
+	}
 
 	data, _ := json.MarshalIndent(map[string]interface{}{"proposal_id": p.ID, "status": p.Status}, "", "  ")
 	s.recordLedger(reqID, principal, "memory_checkpoint", []string{project}, "success", time.Since(start))
@@ -326,7 +367,7 @@ func (s *Server) handleListProposals(ctx context.Context, request mcp.CallToolRe
 
 	proposals, err := s.proposalSvc.List(ctx, proposal.Status(statusStr), limit)
 	if err != nil {
-		s.recordLedger(reqID, principal, "proposal_list", nil, "error: "+err.Error(), time.Since(start))
+		s.recordLedger(reqID, principal, "proposal_list", nil, "error: "+sanitizeError(err), time.Since(start))
 		return nil, fmt.Errorf("list proposals failed: %w", err)
 	}
 
@@ -370,16 +411,13 @@ func (s *Server) handleWrite(ctx context.Context, request mcp.CallToolRequest) (
 	}
 
 	// Check idempotency
-	check, err := s.idempotency.Check(ctx, principal.ID, "memory_write", idempotencyKey, args)
+	existing, err := s.checkIdempotency(ctx, principal.ID, "memory_write", idempotencyKey, args)
 	if err != nil {
-		return nil, fmt.Errorf("idempotency check failed: %w", err)
+		return nil, err
 	}
-	if check.Found {
-		if !check.Matching {
-			return nil, fmt.Errorf("idempotency key exists with different input")
-		}
+	if existing != nil {
 		data, _ := json.MarshalIndent(map[string]interface{}{
-			"event_id": check.Record.ResultingResourceID,
+			"event_id": existing.ResultingResourceID,
 			"existing": true,
 		}, "", "  ")
 		return mcp.NewToolResultText(string(data)), nil
@@ -410,12 +448,15 @@ func (s *Server) handleWrite(ctx context.Context, request mcp.CallToolRequest) (
 	// Write to Lethe
 	event, err := s.lethe.CreateEvent(ctx, letheReq)
 	if err != nil {
-		s.recordLedger(reqID, principal, "memory_write", []string{project}, "error: "+err.Error(), time.Since(start))
+		s.recordLedger(reqID, principal, "memory_write", []string{project}, "error: "+sanitizeError(err), time.Since(start))
 		return nil, fmt.Errorf("write failed: %w", err)
 	}
 
 	// Store idempotency record
-	_ = s.idempotency.Store(ctx, principal.ID, "memory_write", idempotencyKey, args, "success", event.ID, "")
+	_, err = s.storeIdempotency(ctx, principal.ID, "memory_write", idempotencyKey, args, "success", event.ID)
+	if err != nil {
+		return nil, err
+	}
 
 	data, _ := json.MarshalIndent(map[string]interface{}{
 		"event_id": event.ID,
@@ -514,7 +555,7 @@ func (s *Server) handleSearch(ctx context.Context, request mcp.CallToolRequest) 
 
 	result, err := s.lethe.SearchEvents(ctx, letheReq)
 	if err != nil {
-		s.recordLedger(reqID, principal, "memory_search", projects, "error: "+err.Error(), time.Since(start))
+		s.recordLedger(reqID, principal, "memory_search", projects, "error: "+sanitizeError(err), time.Since(start))
 		return nil, fmt.Errorf("search failed: %w", err)
 	}
 
@@ -554,7 +595,7 @@ func (s *Server) handleGet(ctx context.Context, request mcp.CallToolRequest) (*m
 
 	event, err := s.lethe.GetEvent(ctx, eventID)
 	if err != nil {
-		s.recordLedger(reqID, principal, "memory_get", nil, "error: "+err.Error(), time.Since(start))
+		s.recordLedger(reqID, principal, "memory_get", nil, "error: "+sanitizeError(err), time.Since(start))
 		return nil, fmt.Errorf("get failed: %w", err)
 	}
 
@@ -613,7 +654,7 @@ func (s *Server) handleRecent(ctx context.Context, request mcp.CallToolRequest) 
 
 	result, err := s.lethe.RecentEvents(ctx, letheReq)
 	if err != nil {
-		s.recordLedger(reqID, principal, "memory_recent", projects, "error: "+err.Error(), time.Since(start))
+		s.recordLedger(reqID, principal, "memory_recent", projects, "error: "+sanitizeError(err), time.Since(start))
 		return nil, fmt.Errorf("recent failed: %w", err)
 	}
 
@@ -646,6 +687,25 @@ func (s *Server) recordLedger(reqID string, principal auth.Principal, operation 
 		Result:      result,
 		Latency:     latency,
 	})
+}
+
+// sanitizeError redacts potentially sensitive information from error strings
+// before they are recorded in the ledger.
+func sanitizeError(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	// Redact any URLs that might contain credentials
+	if strings.Contains(msg, "://") {
+		// Simple heuristic: if it looks like a URL with credentials, redact
+		msg = "upstream error"
+	}
+	// Limit length to prevent abuse
+	if len(msg) > 256 {
+		msg = msg[:256] + "..."
+	}
+	return msg
 }
 
 // Context key types for auth middleware.

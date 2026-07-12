@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/openlethe/charon/internal/store"
@@ -15,14 +16,14 @@ import (
 
 // Record tracks an idempotent operation.
 type Record struct {
-	PrincipalID        string
-	Operation          string
-	IdempotencyKey     string
-	RequestHash        string
-	Status             string
+	PrincipalID         string
+	Operation           string
+	IdempotencyKey      string
+	RequestHash         string
+	Status              string
 	ResultingResourceID string
-	StoredResponse     string
-	CreatedAt          time.Time
+	StoredResponse      string
+	CreatedAt           time.Time
 }
 
 // Service manages idempotency records.
@@ -37,9 +38,9 @@ func NewService(db *store.DB) *Service {
 
 // CheckResult is returned when checking idempotency.
 type CheckResult struct {
-	Found       bool
-	Matching    bool // true if request hash matches
-	Record      *Record
+	Found    bool
+	Matching bool // true if request hash matches
+	Record   *Record
 }
 
 // Check looks up an existing idempotency record.
@@ -68,18 +69,19 @@ func (s *Service) Check(ctx context.Context, principalID, operation, key string,
 	r.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 
 	// Compute hash of current request
-	expectedHash := hashRequest(requestBody)
+	expectedHash := hashRequestRaw(requestBody)
 
 	return &CheckResult{
 		Found:    true,
-		Matching: r.RequestHash == expectedHash,
+		Matching: string(reqHash) == string(expectedHash),
 		Record:   &r,
 	}, nil
 }
 
 // Store saves an idempotency record after successful operation.
+// Returns ErrDuplicateKey if the key already exists with a different hash.
 func (s *Service) Store(ctx context.Context, principalID, operation, key string, requestBody interface{}, status, resourceID, response string) error {
-	reqHash := hashRequest(requestBody)
+	reqHash := hashRequestRaw(requestBody)
 
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO idempotency_records (
@@ -91,9 +93,27 @@ func (s *Service) Store(ctx context.Context, principalID, operation, key string,
 		status, resourceID, response, time.Now().UTC().Format(time.RFC3339),
 	)
 	if err != nil {
+		if isUniqueViolation(err) {
+			return ErrDuplicateKey
+		}
 		return fmt.Errorf("store idempotency: %w", err)
 	}
 	return nil
+}
+
+func hashRequestRaw(body interface{}) []byte {
+	data, _ := json.Marshal(body)
+	h := sha256.Sum256(data)
+	return h[:]
+}
+
+func isUniqueViolation(err error) bool {
+	if err == nil {
+		return false
+	}
+	// SQLite unique constraint violation: error code 2067 (SQLITE_CONSTRAINT_UNIQUE)
+	// The error message typically contains "UNIQUE constraint failed"
+	return strings.Contains(err.Error(), "UNIQUE constraint failed")
 }
 
 func hashRequest(body interface{}) string {
@@ -105,4 +125,5 @@ func hashRequest(body interface{}) string {
 // Errors returned by idempotency checks.
 var (
 	ErrMismatchedKey = errors.New("idempotency key exists with different input")
+	ErrDuplicateKey  = errors.New("idempotency key already exists")
 )
