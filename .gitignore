@@ -1,2 +1,18 @@
+# Binaries
+charon
+charon.exe
+*.exe
+
+# Build output
+/dist/
+
 # Generated secrets
 charon-data/.secrets
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
