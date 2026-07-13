@@ -27,6 +27,7 @@ services:
       - LETHE_API_KEY=${LETHE_API_KEY}
       - CHARON_HMAC_KEY=${CHARON_HMAC_KEY:-}
       - CHARON_DATA_DIR=/data
+      - CHARON_AUTH_MODE=${CHARON_AUTH_MODE:-obol}
       # Auto-bootstrap (optional)
       - CHARON_AUTO_USER=${CHARON_AUTO_USER:-}
       - CHARON_AUTO_PERMISSION=${CHARON_AUTO_PERMISSION:-propose}

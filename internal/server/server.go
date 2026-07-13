@@ -16,6 +16,7 @@ import (
 	"github.com/openlethe/charon/internal/idempotency"
 	"github.com/openlethe/charon/internal/ledger"
 	"github.com/openlethe/charon/internal/mcp"
+	"github.com/openlethe/charon/internal/oauth"
 	"github.com/openlethe/charon/internal/obol"
 	"github.com/openlethe/charon/internal/proposal"
 	"github.com/openlethe/charon/internal/store"
@@ -27,6 +28,7 @@ type Server struct {
 	cfg       *config.Config
 	db        *store.DB
 	obolSvc   *obol.Service
+	oauthSvc  *oauth.Service
 	ledgerSvc *ledger.Service
 	lethe     *lethe.Client
 	mcpServer *mcp.Server
@@ -42,10 +44,17 @@ func NewServer(cfg *config.Config, db *store.DB, logger *slog.Logger) (*Server, 
 	idempotencySvc := idempotency.NewService(db)
 	mcpServer := mcp.NewServer(cfg, letheClient, ledgerSvc, proposalSvc, idempotencySvc)
 
+	// Initialize OAuth service with HMAC key
+	var oauthSvc *oauth.Service
+	if cfg.HMACKey != "" {
+		oauthSvc = oauth.NewService([]byte(cfg.HMACKey), cfg.PublicURL)
+	}
+
 	return &Server{
 		cfg:       cfg,
 		db:        db,
 		obolSvc:   obolSvc,
+		oauthSvc:  oauthSvc,
 		ledgerSvc: ledgerSvc,
 		lethe:     letheClient,
 		mcpServer: mcpServer,
@@ -57,8 +66,23 @@ func NewServer(cfg *config.Config, db *store.DB, logger *slog.Logger) (*Server, 
 func (s *Server) Start() error {
 	mux := http.NewServeMux()
 
-	// MCP endpoint with auth
-	mux.Handle("/mcp", s.withAuth(s.mcpServer))
+	// MCP endpoint — auth controlled by config
+	switch s.cfg.AuthMode {
+	case "none":
+		s.logger.Warn("MCP endpoint running WITHOUT authentication — testing only")
+		mux.Handle("/mcp", s.mcpServer)
+	case "oauth":
+		if s.oauthSvc == nil {
+			return fmt.Errorf("oauth service not initialized (HMAC key required)")
+		}
+		mux.Handle("/mcp", s.withOAuthAuth(s.mcpServer))
+		// Register OAuth routes
+		oauthHandlers := oauth.NewHandlers(s.oauthSvc)
+		oauthHandlers.RegisterRoutes(mux)
+		s.logger.Info("OAuth 2.0 endpoints registered")
+	default:
+		mux.Handle("/mcp", s.withObolAuth(s.mcpServer))
+	}
 
 	// Health check
 	mux.HandleFunc("/health", s.handleHealth)
@@ -88,11 +112,12 @@ func (s *Server) Start() error {
 		}
 	}()
 
-	s.logger.Info("charon listening", "addr", s.cfg.HTTP)
+	s.logger.Info("charon listening", "addr", s.cfg.HTTP, "auth_mode", s.cfg.AuthMode)
 	return http.ListenAndServe(s.cfg.HTTP, mux)
 }
 
-func (s *Server) withAuth(next http.Handler) http.Handler {
+// withObolAuth validates Obol tokens (legacy, default).
+func (s *Server) withObolAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reqID := generateRequestID()
 		r = r.WithContext(context.WithValue(r.Context(), "request_id", reqID))
@@ -134,6 +159,59 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 	})
 }
 
+// withOAuthAuth validates OAuth 2.0 access tokens.
+func (s *Server) withOAuthAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqID := generateRequestID()
+		r = r.WithContext(context.WithValue(r.Context(), "request_id", reqID))
+
+		// Extract bearer token
+		authHeader := r.Header.Get("Authorization")
+		if !strings.HasPrefix(authHeader, "Bearer ") {
+			// Return 401 with WWW-Authenticate for OAuth discovery
+			w.Header().Set("WWW-Authenticate", `Bearer realm="mcp", resource="`+s.cfg.PublicURL+`/mcp"`)
+			s.logger.Warn("missing bearer token", "request_id", reqID)
+			http.Error(w, `{"error": "unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		token := strings.TrimPrefix(authHeader, "Bearer ")
+
+		// Validate OAuth access token
+		claims, err := s.oauthSvc.ValidateAccessToken(token)
+		if err != nil {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="mcp", error="invalid_token"`)
+			s.logger.Warn("invalid oauth token", "request_id", reqID, "error", err)
+			http.Error(w, `{"error": "unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+
+		// Build principal from OAuth claims
+		principal := auth.Principal{
+			ID:       claims.UserID,
+			Name:     claims.UserID,
+			AgentID:  claims.UserID,
+			Audience: s.cfg.PublicURL,
+			Projects: map[string]struct{}{"default": {}},
+			Scopes:   make(map[string]struct{}),
+		}
+
+		for _, scope := range claims.Scopes {
+			principal.Scopes[scope] = struct{}{}
+		}
+
+		s.logger.Info("authenticated request",
+			"request_id", reqID,
+			"principal", principal.ID,
+			"operation", r.Method,
+			"path", r.URL.Path,
+			"auth", "oauth",
+		)
+
+		ctx := mcp.WithAuth(r.Context(), principal, reqID)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
 func (s *Server) loadPrincipal(ctx context.Context, id string) (auth.Principal, error) {
 	var p auth.Principal
 	var agentID sql.NullString
@@ -144,7 +222,7 @@ func (s *Server) loadPrincipal(ctx context.Context, id string) (auth.Principal, 
 	if agentID.Valid {
 		p.AgentID = agentID.String
 	} else {
-		p.AgentID = p.ID // Fallback to principal ID if no agent_id set
+		p.AgentID = p.ID
 	}
 
 	// Load projects

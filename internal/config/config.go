@@ -50,6 +50,10 @@ type Config struct {
 
 	// RequestTimeout for upstream Lethe calls.
 	RequestTimeout time.Duration `env:"CHARON_REQUEST_TIMEOUT" envDefault:"10s"`
+
+	// AuthMode controls MCP endpoint authentication.
+	// "obol" = require Obol token (default), "oauth" = OAuth 2.0, "none" = no auth (testing only).
+	AuthMode string `env:"CHARON_AUTH_MODE" envDefault:"obol"`
 }
 
 // FromEnv loads configuration from environment variables.
@@ -67,6 +71,7 @@ func FromEnv() (*Config, error) {
 		MaxResultBytes: 1048576,
 		MaxResultCount: 100,
 		RequestTimeout: 10 * time.Second,
+		AuthMode:       getEnv("CHARON_AUTH_MODE", "obol"),
 	}
 
 	if cfg.Mode != ModeDirect {
@@ -81,8 +86,8 @@ func FromEnv() (*Config, error) {
 		return nil, errors.New("LETHE_API_KEY is required")
 	}
 
-	if cfg.HMACKey == "" {
-		return nil, errors.New("CHARON_HMAC_KEY is required")
+	if cfg.HMACKey == "" && cfg.AuthMode != "none" {
+		return nil, errors.New("CHARON_HMAC_KEY is required (set CHARON_AUTH_MODE=none to skip for testing)")
 	}
 
 	if err := validateAdminBind(cfg.AdminHTTP); err != nil {
