@@ -4,6 +4,7 @@ package auth
 type Principal struct {
 	ID       string
 	Name     string
+	AgentID  string            // Maps to Lethe's agent_id for event attribution
 	Projects map[string]struct{}
 	Scopes   map[string]struct{}
 	Audience string

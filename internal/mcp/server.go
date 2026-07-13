@@ -231,6 +231,7 @@ func (s *Server) handlePropose(ctx context.Context, request mcp.CallToolRequest)
 		Confidence:     confidence,
 		Tags:           tags,
 		Provenance:     prov,
+		AgentID:        principal.AgentID, // Attribution for external agents
 		IdempotencyKey: idempotencyKey,
 		RequestID:      reqID,
 	}
@@ -318,6 +319,7 @@ func (s *Server) handleCheckpoint(ctx context.Context, request mcp.CallToolReque
 		Confidence:     1.0,
 		Tags:           []string{"checkpoint"},
 		Provenance:     prov,
+		AgentID:        principal.AgentID, // Attribution for external agents
 		IdempotencyKey: idempotencyKey,
 		RequestID:      reqID,
 	}

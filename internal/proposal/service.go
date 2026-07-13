@@ -77,6 +77,7 @@ type CreateRequest struct {
 	Confidence     float64
 	Tags           []string
 	Provenance     Provenance
+	AgentID        string // Maps to Lethe agent_id for attribution
 	IdempotencyKey string
 	RequestID      string
 }

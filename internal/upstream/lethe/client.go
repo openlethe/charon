@@ -101,6 +101,7 @@ type CreateEventRequest struct {
 	Kind    string   `json:"kind,omitempty"`
 	Content string   `json:"content"`
 	Tags    []string `json:"tags,omitempty"`
+	AgentID string   `json:"agent_id,omitempty"` // Attribution for external agents
 }
 
 // SearchEvents queries Lethe for events.

@@ -83,6 +83,18 @@ func (db *DB) migrate() error {
 		}
 	}
 
+	if currentVersion < 3 {
+		if err := db.migrateV3(); err != nil {
+			return err
+		}
+		if _, err := db.ExecContext(ctx,
+			"INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+			3, time.Now().UTC().Format(time.RFC3339),
+		); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -196,6 +208,29 @@ func (db *DB) migrateV2() error {
 	for _, stmt := range statements {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("migration v2: %w", err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+func (db *DB) migrateV3() error {
+	ctx := context.Background()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	statements := []string{
+		`ALTER TABLE principals ADD COLUMN agent_id TEXT`,
+		`UPDATE principals SET agent_id = id WHERE agent_id IS NULL`,
+		`CREATE INDEX idx_principals_agent ON principals(agent_id)`,
+	}
+
+	for _, stmt := range statements {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("migration v3: %w", err)
 		}
 	}
 

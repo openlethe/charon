@@ -135,8 +135,8 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 
 func (s *Server) loadPrincipal(ctx context.Context, id string) (auth.Principal, error) {
 	var p auth.Principal
-	row := s.db.QueryRowContext(ctx, "SELECT id, name FROM principals WHERE id = ?", id)
-	if err := row.Scan(&p.ID, &p.Name); err != nil {
+	row := s.db.QueryRowContext(ctx, "SELECT id, name, agent_id FROM principals WHERE id = ?", id)
+	if err := row.Scan(&p.ID, &p.Name, &p.AgentID); err != nil {
 		return p, fmt.Errorf("load principal: %w", err)
 	}
 
