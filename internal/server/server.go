@@ -44,10 +44,10 @@ func NewServer(cfg *config.Config, db *store.DB, logger *slog.Logger) (*Server, 
 	idempotencySvc := idempotency.NewService(db)
 	mcpServer := mcp.NewServer(cfg, letheClient, ledgerSvc, proposalSvc, idempotencySvc)
 
-	// Initialize OAuth service with HMAC key
+	// Initialize OAuth service with HMAC key and client ID
 	var oauthSvc *oauth.Service
 	if cfg.HMACKey != "" {
-		oauthSvc = oauth.NewService([]byte(cfg.HMACKey), cfg.PublicURL)
+		oauthSvc = oauth.NewService([]byte(cfg.HMACKey), cfg.PublicURL, cfg.OAuthClientID)
 	}
 
 	return &Server{
@@ -165,11 +165,26 @@ func (s *Server) withOAuthAuth(next http.Handler) http.Handler {
 		reqID := generateRequestID()
 		r = r.WithContext(context.WithValue(r.Context(), "request_id", reqID))
 
+		// Allow CORS preflight requests
+		if r.Method == http.MethodOptions {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept, MCP-Protocol-Version")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
 		// Extract bearer token
 		authHeader := r.Header.Get("Authorization")
 		if !strings.HasPrefix(authHeader, "Bearer ") {
-			// Return 401 with WWW-Authenticate for OAuth discovery
-			w.Header().Set("WWW-Authenticate", `Bearer realm="mcp", resource="`+s.cfg.PublicURL+`/mcp"`)
+			// Return 401 with WWW-Authenticate for OAuth discovery per MCP spec
+			metadataURL := s.oauthSvc.OAuthMetadataURL()
+			clientID := s.oauthSvc.OAuthClientID()
+			challenge := `Bearer resource_metadata="` + metadataURL + `"`
+			if clientID != "" {
+				challenge += `, client_id="` + clientID + `"`
+			}
+			w.Header().Set("WWW-Authenticate", challenge)
 			s.logger.Warn("missing bearer token", "request_id", reqID)
 			http.Error(w, `{"error": "unauthorized"}`, http.StatusUnauthorized)
 			return
@@ -179,7 +194,7 @@ func (s *Server) withOAuthAuth(next http.Handler) http.Handler {
 		// Validate OAuth access token
 		claims, err := s.oauthSvc.ValidateAccessToken(token)
 		if err != nil {
-			w.Header().Set("WWW-Authenticate", `Bearer realm="mcp", error="invalid_token"`)
+			w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
 			s.logger.Warn("invalid oauth token", "request_id", reqID, "error", err)
 			http.Error(w, `{"error": "unauthorized"}`, http.StatusUnauthorized)
 			return

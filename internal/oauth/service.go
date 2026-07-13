@@ -21,6 +21,7 @@ type Service struct {
 	mu          sync.RWMutex
 	hmacKey     []byte
 	issuer      string
+	clientID    string
 	tokenExpiry time.Duration
 
 	// Static clients (client_id -> client config)
@@ -72,10 +73,11 @@ type AccessTokenClaims struct {
 }
 
 // NewService creates an OAuth service.
-func NewService(hmacKey []byte, issuer string) *Service {
+func NewService(hmacKey []byte, issuer, clientID string) *Service {
 	s := &Service{
 		hmacKey:     hmacKey,
 		issuer:      issuer,
+		clientID:    clientID,
 		tokenExpiry: 24 * time.Hour,
 		clients:     make(map[string]*Client),
 		authCodes:   make(map[string]*authCode),
@@ -83,7 +85,6 @@ func NewService(hmacKey []byte, issuer string) *Service {
 	}
 
 	// Register a default public client for ChatGPT MCP
-	// ChatGPT will use this client ID or we can support dynamic registration later
 	s.clients["chatgpt-mcp"] = &Client{
 		ID:           "chatgpt-mcp",
 		Name:         "ChatGPT MCP",
@@ -110,7 +111,7 @@ func (s *Service) GetClient(id string) *Client {
 
 // AuthorizationServerMetadata returns the OAuth 2.0 Authorization Server Metadata.
 func (s *Service) AuthorizationServerMetadata() map[string]interface{} {
-	return map[string]interface{}{
+	meta := map[string]interface{}{
 		"issuer":                 s.issuer,
 		"authorization_endpoint": s.issuer + "/oauth/authorize",
 		"token_endpoint":         s.issuer + "/oauth/token",
@@ -120,15 +121,33 @@ func (s *Service) AuthorizationServerMetadata() map[string]interface{} {
 		"code_challenge_methods_supported":      []string{"S256"},
 		"scopes_supported":                        []string{"memory.read", "memory.search", "memory.propose", "memory.write"},
 	}
+	if s.clientID != "" {
+		meta["client_id"] = s.clientID
+	}
+	return meta
 }
 
 // ProtectedResourceMetadata returns the OAuth 2.0 Protected Resource Metadata.
 func (s *Service) ProtectedResourceMetadata() map[string]interface{} {
-	return map[string]interface{}{
+	meta := map[string]interface{}{
 		"resource":              s.issuer + "/mcp",
 		"authorization_servers": []string{s.issuer},
 		"scopes_supported":      []string{"memory.read", "memory.search", "memory.propose", "memory.write"},
 	}
+	if s.clientID != "" {
+		meta["client_id"] = s.clientID
+	}
+	return meta
+}
+
+// OAuthClientID returns the configured OAuth client ID.
+func (s *Service) OAuthClientID() string {
+	return s.clientID
+}
+
+// OAuthMetadataURL returns the full URL to the OAuth protected resource metadata.
+func (s *Service) OAuthMetadataURL() string {
+	return s.issuer + "/.well-known/oauth-protected-resource"
 }
 
 // GenerateAuthCode creates an authorization code for the authorization code flow.

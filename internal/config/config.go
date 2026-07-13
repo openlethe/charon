@@ -33,6 +33,9 @@ type Config struct {
 	// PublicURL is the external URL clients use to reach Charon.
 	PublicURL string `env:"CHARON_PUBLIC_URL"`
 
+	// OAuthClientID is the client_id advertised in OAuth protected resource metadata.
+	OAuthClientID string `env:"CHARON_OAUTH_CLIENT_ID" envDefault:"chatgpt-mcp"`
+
 	// DataDir is the directory for SQLite and other persistent data.
 	DataDir string `env:"CHARON_DATA_DIR" envDefault:"./data"`
 
@@ -88,6 +91,10 @@ func FromEnv() (*Config, error) {
 
 	if cfg.HMACKey == "" && cfg.AuthMode != "none" {
 		return nil, errors.New("CHARON_HMAC_KEY is required (set CHARON_AUTH_MODE=none to skip for testing)")
+	}
+
+	if cfg.PublicURL == "" && cfg.AuthMode == "oauth" {
+		return nil, errors.New("CHARON_PUBLIC_URL is required for OAuth mode")
 	}
 
 	if err := validateAdminBind(cfg.AdminHTTP); err != nil {
