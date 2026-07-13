@@ -9,7 +9,7 @@ RUN CGO_ENABLED=0 go build -ldflags '-s -w' -o charon ./cmd/charon
 
 FROM alpine:latest
 
-RUN apk add --no-cache ca-certificates sqlite
+RUN apk add --no-cache ca-certificates sqlite openssl
 
 WORKDIR /app
 COPY --from=builder /app/charon /usr/local/bin/charon
