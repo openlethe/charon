@@ -133,6 +133,9 @@ func runObol() error {
 				expires = d
 			} else if !strings.HasPrefix(os.Args[i], "-") && principalID == "" {
 				principalID = os.Args[i]
+			} else if strings.HasPrefix(os.Args[i], "-") {
+				fmt.Fprintf(os.Stderr, "Unknown flag: %s\n", os.Args[i])
+				os.Exit(1)
 			}
 		}
 		
