@@ -126,7 +126,7 @@ if [ -n "$CHARON_AUTO_USER" ]; then
 fi
 
 # Print OAuth configuration for easy client setup
-if [ -n "$CHARON_PUBLIC_URL" ]; then
+if [ "${CHARON_AUTH_MODE:-obol}" = "oauth" ] && [ -n "$CHARON_PUBLIC_URL" ]; then
     echo ""
     echo "╔══════════════════════════════════════════════════════════════╗"
     echo "║  OAuth / MCP Client Configuration                            ║"

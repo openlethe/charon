@@ -12,8 +12,9 @@ import (
 
 // Handlers provides HTTP handlers for OAuth 2.0 endpoints.
 type Handlers struct {
-	service     *Service
-	rateLimiter *RateLimiter
+	service           *Service
+	rateLimiter       *RateLimiter
+	globalRateLimiter *RateLimiter // Prevents auto-registration bypass
 }
 
 // RateLimiter provides simple per-client rate limiting for the token endpoint.
@@ -62,8 +63,9 @@ func (rl *RateLimiter) Allow(clientID string) bool {
 // NewHandlers creates OAuth HTTP handlers.
 func NewHandlers(service *Service) *Handlers {
 	return &Handlers{
-		service:     service,
-		rateLimiter: NewRateLimiter(1*time.Minute, 60), // 60 requests per minute per client
+		service:           service,
+		rateLimiter:       NewRateLimiter(1*time.Minute, 60),  // Per client
+		globalRateLimiter: NewRateLimiter(1*time.Minute, 120), // Global cap across all clients
 	}
 }
 
@@ -123,6 +125,11 @@ func (h *Handlers) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	client := h.service.GetClient(clientID)
 	if client == nil {
 		// Auto-register unknown clients as public clients (MCP dynamic registration simplified)
+		// Cap at 1000 auto-registered clients to prevent unbounded memory growth
+		if h.service.AutoClientCount() >= 1000 {
+				http.Error(w, "client registration limit reached", http.StatusServiceUnavailable)
+				return
+		}
 		client = &Client{
 			ID:           clientID,
 			Name:         clientID,
@@ -234,6 +241,12 @@ func (h *Handlers) handleToken(w http.ResponseWriter, r *http.Request) {
 			clientID = id
 			clientSecret = secret
 		}
+	}
+
+	// Global rate limit first (prevents auto-registration bypass)
+	if !h.globalRateLimiter.Allow("global") {
+		WriteErrorResponse(w, "slow_down", "rate limit exceeded", http.StatusTooManyRequests)
+		return
 	}
 
 	client := h.service.GetClient(clientID)

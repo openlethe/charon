@@ -123,6 +123,19 @@ func (s *Service) GetClient(id string) *Client {
 	return s.clients[id]
 }
 
+// AutoClientCount returns the number of auto-registered (non-builtin) clients.
+func (s *Service) AutoClientCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	count := 0
+	for id := range s.clients {
+		if id != "chatgpt-mcp" && id != s.clientID {
+			count++
+		}
+	}
+	return count
+}
+
 // AuthorizationServerMetadata returns the OAuth 2.0 Authorization Server Metadata.
 func (s *Service) AuthorizationServerMetadata() map[string]interface{} {
 	meta := map[string]interface{}{
