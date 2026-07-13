@@ -16,8 +16,8 @@ if [ -z "$CHARON_HMAC_KEY" ]; then
         export CHARON_HMAC_KEY=$(cat "$SECRETS_FILE" | grep CHARON_HMAC_KEY | cut -d= -f2)
         echo "Loaded existing HMAC key from ${SECRETS_FILE}"
     else
-        # Generate new key using /dev/urandom (openssl not available in minimal image)
-        HMAC_KEY=$(head -c 32 /dev/urandom | xxd -p | tr -d '\n')
+        # Generate new key using openssl (now available in image)
+        HMAC_KEY=$(openssl rand -hex 32)
         export CHARON_HMAC_KEY="$HMAC_KEY"
         echo "CHARON_HMAC_KEY=$HMAC_KEY" > "$SECRETS_FILE"
         chmod 600 "$SECRETS_FILE"
