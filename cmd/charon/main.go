@@ -8,6 +8,8 @@ import (
 	"log"
 	"log/slog"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/openlethe/charon/internal/config"
@@ -103,11 +105,33 @@ func runObol() error {
 	switch sub {
 	case "mint":
 		if len(os.Args) < 4 {
-			fmt.Fprintln(os.Stderr, "Usage: charon obol mint <principal-id>")
+			fmt.Fprintln(os.Stderr, "Usage: charon obol mint [flags] <principal-id>")
+			fmt.Fprintln(os.Stderr, "  --expires <duration>  Token expiry duration (e.g., 7d, 1h, 30m). Default: 30d")
 			os.Exit(1)
 		}
-		principalID := os.Args[3]
-		o, err := obolSvc.Mint(ctx, principalID, cfg.PublicURL, 30*24*time.Hour)
+		
+		// Parse optional flags
+		expires := 30 * 24 * time.Hour // default 30 days
+		principalID := os.Args[len(os.Args)-1]
+		
+		for i := 3; i < len(os.Args)-1; i++ {
+			switch os.Args[i] {
+			case "--expires":
+				if i+1 >= len(os.Args)-1 {
+					fmt.Fprintln(os.Stderr, "Missing value for --expires")
+					os.Exit(1)
+				}
+				i++
+				d, err := parseDuration(os.Args[i])
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Invalid duration: %v\n", err)
+					os.Exit(1)
+				}
+				expires = d
+			}
+		}
+		
+		o, err := obolSvc.Mint(ctx, principalID, cfg.PublicURL, expires)
 		if err != nil {
 			return err
 		}
@@ -181,8 +205,8 @@ func runPrincipal() error {
 		name := os.Args[3]
 		id := fmt.Sprintf("principal_%s", generateID())
 		_, err := db.ExecContext(ctx,
-			"INSERT INTO principals (id, name, created_at) VALUES (?, ?, ?)",
-			id, name, time.Now().UTC().Format(time.RFC3339),
+			"INSERT INTO principals (id, name, agent_id, created_at) VALUES (?, ?, ?, ?)",
+			id, name, id, time.Now().UTC().Format(time.RFC3339),
 		)
 		if err != nil {
 			return err
@@ -345,4 +369,38 @@ func generateID() string {
 	b := make([]byte, 8)
 	rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// parseDuration parses a duration string like "7d", "1h", "30m"
+func parseDuration(s string) (time.Duration, error) {
+	s = strings.TrimSpace(s)
+	if len(s) == 0 {
+		return 0, fmt.Errorf("empty duration")
+	}
+	
+	// Check for suffix
+	var unit time.Duration
+	var numStr string
+	
+	switch {
+	case strings.HasSuffix(s, "d"):
+		unit = 24 * time.Hour
+		numStr = s[:len(s)-1]
+	case strings.HasSuffix(s, "h"):
+		unit = time.Hour
+		numStr = s[:len(s)-1]
+	case strings.HasSuffix(s, "m"):
+		unit = time.Minute
+		numStr = s[:len(s)-1]
+	default:
+		// Try standard Go duration parsing
+		return time.ParseDuration(s)
+	}
+	
+	num, err := strconv.Atoi(numStr)
+	if err != nil {
+		return 0, fmt.Errorf("invalid number: %w", err)
+	}
+	
+	return time.Duration(num) * unit, nil
 }

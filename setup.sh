@@ -35,6 +35,9 @@ CHARON_HMAC_KEY=${CHARON_HMAC_KEY}
 # Public URL (update after creating Cloudflare Tunnel)
 CHARON_PUBLIC_URL=http://localhost:18484
 
+# Data directory for SQLite database (must match docker-compose volume)
+CHARON_DATA_DIR=${DATA_DIR}
+
 # Admin bind (Unix socket for security)
 CHARON_ADMIN_HTTP=/tmp/charon-admin.sock
 EOF

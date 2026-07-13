@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
@@ -135,9 +136,15 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 
 func (s *Server) loadPrincipal(ctx context.Context, id string) (auth.Principal, error) {
 	var p auth.Principal
+	var agentID sql.NullString
 	row := s.db.QueryRowContext(ctx, "SELECT id, name, agent_id FROM principals WHERE id = ?", id)
-	if err := row.Scan(&p.ID, &p.Name, &p.AgentID); err != nil {
+	if err := row.Scan(&p.ID, &p.Name, &agentID); err != nil {
 		return p, fmt.Errorf("load principal: %w", err)
+	}
+	if agentID.Valid {
+		p.AgentID = agentID.String
+	} else {
+		p.AgentID = p.ID // Fallback to principal ID if no agent_id set
 	}
 
 	// Load projects
