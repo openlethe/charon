@@ -71,9 +71,10 @@ func (s *Service) Check(ctx context.Context, principalID, operation, key string,
 	// Compute hash of current request
 	expectedHash := hashRequestRaw(requestBody)
 
-	// Backward compatibility: accept both hex-encoded and raw hashes
-	storedHash := hex.EncodeToString(reqHash)
-	decodedHash, decodeErr := hex.DecodeString(storedHash)
+	// Backward compatibility: accept both hex-encoded and raw hashes.
+	// Legacy rows stored the 64-byte hex string; new rows store raw 32-byte digest.
+	storedHex := string(reqHash)
+	decodedHash, decodeErr := hex.DecodeString(storedHex)
 	if decodeErr == nil && len(decodedHash) == sha256.Size {
 		// Stored value is valid hex of raw hash
 		return &CheckResult{
@@ -83,6 +84,7 @@ func (s *Service) Check(ctx context.Context, principalID, operation, key string,
 		}, nil
 	}
 
+	// Fallback: compare raw bytes directly (new format)
 	return &CheckResult{
 		Found:    true,
 		Matching: string(reqHash) == string(expectedHash),
