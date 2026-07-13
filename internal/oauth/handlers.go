@@ -122,8 +122,14 @@ func (h *Handlers) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 
 	client := h.service.GetClient(clientID)
 	if client == nil {
-		http.Error(w, "invalid client", http.StatusBadRequest)
-		return
+		// Auto-register unknown clients as public clients (MCP dynamic registration simplified)
+		client = &Client{
+			ID:           clientID,
+			Name:         clientID,
+			RedirectURIs: []string{},
+			Public:       true,
+		}
+		h.service.RegisterClient(client)
 	}
 
 	// Validate redirect_uri

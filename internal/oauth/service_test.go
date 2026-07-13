@@ -277,6 +277,39 @@ func TestConfiguredClientID(t *testing.T) {
 	}
 }
 
+// TestAutoRegistration verifies that unknown client IDs are auto-registered
+// as public clients (MCP dynamic client registration simplified).
+func TestAutoRegistration(t *testing.T) {
+	s, err := NewService([]byte("test-key-32-bytes-long-for-hs256"), "https://example.com", "chatgpt-mcp")
+	if err != nil {
+		t.Fatalf("NewService failed: %v", err)
+	}
+	h := NewHandlers(s)
+
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	// Request auth with an unknown client ID
+	req := httptest.NewRequest(http.MethodGet, "/oauth/authorize?client_id=chatgpt-generated-id&redirect_uri=https://example.com/callback&state=xyz&code_challenge=challenge", nil)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	// Should redirect with code (auto-registered)
+	if rr.Code != http.StatusFound {
+		t.Fatalf("expected 302 redirect, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	location := rr.Header().Get("Location")
+	if !strings.Contains(location, "code=") {
+		t.Errorf("expected redirect with code, got: %s", location)
+	}
+
+	// Verify the client was registered
+	if s.GetClient("chatgpt-generated-id") == nil {
+		t.Error("auto-registered client should exist")
+	}
+}
+
 // TestRateLimiting verifies that the token endpoint rate limits per client.
 func TestRateLimiting(t *testing.T) {
 	s, err := NewService([]byte("test-key-32-bytes-long-for-hs256"), "https://example.com", "chatgpt-mcp")

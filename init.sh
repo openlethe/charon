@@ -13,8 +13,19 @@ SECRETS_FILE="${DATA_DIR}/.secrets"
 if [ -z "$CHARON_HMAC_KEY" ]; then
     if [ -f "$SECRETS_FILE" ]; then
         # Load previously generated key
-        export CHARON_HMAC_KEY=$(cat "$SECRETS_FILE" | grep CHARON_HMAC_KEY | cut -d= -f2)
-        echo "Loaded existing HMAC key from ${SECRETS_FILE}"
+        SAVED_KEY=$(grep "^CHARON_HMAC_KEY=" "$SECRETS_FILE" | tail -1 | cut -d= -f2)
+        if [ -n "$SAVED_KEY" ] && [ ${#SAVED_KEY} -ge 32 ]; then
+            export CHARON_HMAC_KEY="$SAVED_KEY"
+            echo "Loaded existing HMAC key from ${SECRETS_FILE}"
+        else
+            echo "WARNING: Invalid HMAC key in ${SECRETS_FILE}, regenerating..."
+            rm -f "$SECRETS_FILE"
+            HMAC_KEY=$(openssl rand -hex 32)
+            export CHARON_HMAC_KEY="$HMAC_KEY"
+            echo "CHARON_HMAC_KEY=$HMAC_KEY" > "$SECRETS_FILE"
+            chmod 600 "$SECRETS_FILE"
+            echo "Generated new HMAC key (saved to ${SECRETS_FILE})"
+        fi
     else
         # Generate new key using openssl (now available in image)
         HMAC_KEY=$(openssl rand -hex 32)
@@ -112,6 +123,22 @@ if [ -n "$CHARON_AUTO_USER" ]; then
         # Create marker file to prevent re-bootstrap
         touch "$BOOTSTRAP_MARKER"
     fi
+fi
+
+# Print OAuth configuration for easy client setup
+if [ -n "$CHARON_PUBLIC_URL" ]; then
+    echo ""
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    echo "║  OAuth / MCP Client Configuration                            ║"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo ""
+    echo "  Client ID: ${CHARON_OAUTH_CLIENT_ID:-chatgpt-mcp}"
+    echo "  Metadata:   ${CHARON_PUBLIC_URL}/.well-known/oauth-protected-resource"
+    echo "  Authorize:  ${CHARON_PUBLIC_URL}/oauth/authorize"
+    echo "  Token:      ${CHARON_PUBLIC_URL}/oauth/token"
+    echo ""
+    echo "  (Any client ID works — Charon auto-registers unknown clients)"
+    echo ""
 fi
 
 # Start charon

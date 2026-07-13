@@ -72,6 +72,16 @@ func runServe() error {
 
 	logger.Info("starting charon", "mode", cfg.Mode, "upstream", cfg.Upstream)
 
+	// Print OAuth configuration for easy client setup
+	if cfg.AuthMode == "oauth" {
+		logger.Info("oauth configuration", 
+			"client_id", cfg.OAuthClientID,
+			"metadata_url", cfg.PublicURL+"/.well-known/oauth-protected-resource",
+			"authorize_url", cfg.PublicURL+"/oauth/authorize",
+			"token_url", cfg.PublicURL+"/oauth/token",
+		)
+	}
+
 	srv, err := server.NewServer(cfg, db, logger)
 	if err != nil {
 		return fmt.Errorf("server: %w", err)
