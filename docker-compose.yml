@@ -11,7 +11,7 @@ services:
       - styx
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:18483/api/health"]
+      test: ["CMD", "sh", "-c", "wget -qO- --header=\"Authorization: Bearer $${LETHE_API_KEY}\" http://localhost:18483/api/health"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -25,7 +25,7 @@ services:
       - CHARON_UPSTREAM=http://lethe:18483
       - CHARON_PUBLIC_URL=${CHARON_PUBLIC_URL:-http://localhost:18484}
       - LETHE_API_KEY=${LETHE_API_KEY}
-      - CHARON_HMAC_KEY=${CHARON_HMAC_KEY}
+      - CHARON_HMAC_KEY=${CHARON_HMAC_KEY:-}
       - CHARON_DATA_DIR=/data
       # Auto-bootstrap (optional)
       - CHARON_AUTO_USER=${CHARON_AUTO_USER:-}

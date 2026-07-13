@@ -2,11 +2,48 @@
 set -e
 
 # Charon Init Script
-# Auto-bootstraps principal if CHARON_AUTO_USER is set and DB is empty
+# Auto-bootstraps principal and generates secrets on first start
 # Runs once on first container start, then delegates to charon serve
 
 CHARON_BIN="/usr/local/bin/charon"
 DATA_DIR="${CHARON_DATA_DIR:-/data}"
+SECRETS_FILE="${DATA_DIR}/.secrets"
+
+# Auto-generate HMAC key if not provided
+if [ -z "$CHARON_HMAC_KEY" ]; then
+    if [ -f "$SECRETS_FILE" ]; then
+        # Load previously generated key
+        export CHARON_HMAC_KEY=$(cat "$SECRETS_FILE" | grep CHARON_HMAC_KEY | cut -d= -f2)
+        echo "Loaded existing HMAC key from ${SECRETS_FILE}"
+    else
+        # Generate new key using /dev/urandom (openssl not available in minimal image)
+        HMAC_KEY=$(head -c 32 /dev/urandom | xxd -p | tr -d '\n')
+        export CHARON_HMAC_KEY="$HMAC_KEY"
+        echo "CHARON_HMAC_KEY=$HMAC_KEY" > "$SECRETS_FILE"
+        chmod 600 "$SECRETS_FILE"
+        echo ""
+        echo "╔══════════════════════════════════════════════════════════════╗"
+        echo "║  Charon Auto-Generated Secrets                               ║"
+        echo "╚══════════════════════════════════════════════════════════════╝"
+        echo ""
+        echo "Generated CHARON_HMAC_KEY (saved to ${SECRETS_FILE})"
+        echo ""
+        echo "IMPORTANT: Add this to your .env file for future restarts:"
+        echo "  CHARON_HMAC_KEY=$HMAC_KEY"
+        echo ""
+    fi
+fi
+
+# Validate Lethe key is set
+if [ -z "$LETHE_API_KEY" ]; then
+    echo "ERROR: LETHE_API_KEY is required."
+    echo ""
+    echo "Generate one with: docker run --rm lethe:local-v0.4 keygen"
+    echo "Then add it to your .env file:"
+    echo "  LETHE_API_KEY=lethe_xxx..."
+    echo ""
+    exit 1
+fi
 
 # Check if we should auto-bootstrap
 if [ -n "$CHARON_AUTO_USER" ]; then
