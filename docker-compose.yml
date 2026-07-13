@@ -27,6 +27,11 @@ services:
       - LETHE_API_KEY=${LETHE_API_KEY}
       - CHARON_HMAC_KEY=${CHARON_HMAC_KEY}
       - CHARON_DATA_DIR=/data
+      # Auto-bootstrap (optional)
+      - CHARON_AUTO_USER=${CHARON_AUTO_USER:-}
+      - CHARON_AUTO_PERMISSION=${CHARON_AUTO_PERMISSION:-propose}
+      - CHARON_AUTO_PROJECT=${CHARON_AUTO_PROJECT:-default}
+      - CHARON_AUTO_EXPIRES=${CHARON_AUTO_EXPIRES:-7d}
     volumes:
       - ./charon-data:/data
       - ./secrets:/secrets:ro
