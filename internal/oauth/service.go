@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -17,6 +18,7 @@ import (
 
 // Service provides OAuth 2.0 authorization server capabilities for MCP.
 type Service struct {
+	mu          sync.RWMutex
 	hmacKey     []byte
 	issuer      string
 	tokenExpiry time.Duration
@@ -94,11 +96,15 @@ func NewService(hmacKey []byte, issuer string) *Service {
 
 // RegisterClient adds a new OAuth client.
 func (s *Service) RegisterClient(client *Client) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.clients[client.ID] = client
 }
 
 // GetClient returns a registered client by ID.
 func (s *Service) GetClient(id string) *Client {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.clients[id]
 }
 
@@ -127,7 +133,9 @@ func (s *Service) ProtectedResourceMetadata() map[string]interface{} {
 
 // GenerateAuthCode creates an authorization code for the authorization code flow.
 func (s *Service) GenerateAuthCode(clientID, userID, redirectURI, pkceChallenge, pkceMethod string) (string, error) {
-	client := s.GetClient(clientID)
+	s.mu.RLock()
+	client := s.clients[clientID]
+	s.mu.RUnlock()
 	if client == nil {
 		return "", fmt.Errorf("invalid client_id")
 	}
@@ -148,6 +156,8 @@ func (s *Service) GenerateAuthCode(clientID, userID, redirectURI, pkceChallenge,
 		ExpiresAt:     time.Now().Add(10 * time.Minute),
 	}
 
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.authCodes[code] = ac
 
 	return code, nil
@@ -155,35 +165,48 @@ func (s *Service) GenerateAuthCode(clientID, userID, redirectURI, pkceChallenge,
 
 // ExchangeAuthCode exchanges an authorization code for tokens.
 func (s *Service) ExchangeAuthCode(code, clientID, redirectURI, codeVerifier string) (*TokenResponse, error) {
+	s.mu.Lock()
 	ac, ok := s.authCodes[code]
 	if !ok || ac.Used || time.Now().After(ac.ExpiresAt) {
+		s.mu.Unlock()
 		return nil, fmt.Errorf("invalid authorization code")
 	}
 
 	// Verify client_id matches
 	if ac.ClientID != clientID {
+		s.mu.Unlock()
 		return nil, fmt.Errorf("client_id mismatch")
+	}
+
+	// Verify redirect_uri matches if it was provided during authorization
+	if ac.RedirectURI != "" && ac.RedirectURI != redirectURI {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("redirect_uri mismatch")
 	}
 
 	// Verify PKCE
 	if ac.PKCEChallenge != "" {
 		if codeVerifier == "" {
+			s.mu.Unlock()
 			return nil, fmt.Errorf("missing code_verifier")
 		}
 		if ac.PKCEMethod == "S256" {
 			hash := sha256.Sum256([]byte(codeVerifier))
 			challenge := base64.RawURLEncoding.EncodeToString(hash[:])
 			if subtle.ConstantTimeCompare([]byte(challenge), []byte(ac.PKCEChallenge)) != 1 {
+				s.mu.Unlock()
 				return nil, fmt.Errorf("invalid code_verifier")
 			}
 		} else if ac.PKCEMethod == "plain" {
 			if subtle.ConstantTimeCompare([]byte(codeVerifier), []byte(ac.PKCEChallenge)) != 1 {
+				s.mu.Unlock()
 				return nil, fmt.Errorf("invalid code_verifier")
 			}
 		}
 	}
 
 	ac.Used = true
+	s.mu.Unlock()
 
 	// Generate access token
 	token, err := s.GenerateAccessToken(ac.UserID, clientID, []string{"memory.read", "memory.search", "memory.propose"})
@@ -223,6 +246,8 @@ func (s *Service) GenerateAccessToken(userID, clientID string, scopes []string) 
 	}
 
 	// Record token for validation
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.tokens[claims.ID] = &tokenRecord{
 		Token:     signed,
 		UserID:    userID,

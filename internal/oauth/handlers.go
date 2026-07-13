@@ -200,6 +200,12 @@ func (h *Handlers) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.R
 }
 
 func (h *Handlers) handleClientCredentialsGrant(w http.ResponseWriter, r *http.Request, client *Client) {
+	// Public clients cannot use client_credentials grant — they cannot authenticate
+	if client.Public {
+		WriteErrorResponse(w, "unauthorized_client", "public clients are not allowed to use the client_credentials grant", http.StatusUnauthorized)
+		return
+	}
+
 	// For client credentials, issue a token with limited scopes
 	scopes := []string{"memory.read", "memory.search"}
 	requestedScope := r.PostFormValue("scope")
