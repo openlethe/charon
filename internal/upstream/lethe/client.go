@@ -37,7 +37,7 @@ type Event struct {
 	Type      string                 `json:"type"`
 	Kind      string                 `json:"kind,omitempty"`
 	Content   string                 `json:"content"`
-	Tags      []string               `json:"tags,omitempty"`
+	Tags      interface{}            `json:"tags,omitempty"`
 	Metadata  map[string]interface{} `json:"metadata,omitempty"`
 	CreatedAt string                 `json:"created_at"`
 }
@@ -104,7 +104,33 @@ type CreateEventRequest struct {
 
 // SearchEvents queries Lethe for events.
 func (c *Client) SearchEvents(ctx context.Context, req SearchRequest) (*SearchResult, error) {
-	return c.postSearch(ctx, "/api/search", req)
+	// Lethe v0.4 uses GET /api/events/search with query params
+	url := fmt.Sprintf("/api/events/search?q=%s&limit=%d", req.Query, req.Limit)
+	if len(req.EventTypes) > 0 {
+		for _, et := range req.EventTypes {
+			url += fmt.Sprintf("&eventType=%s", et)
+		}
+	}
+	if len(req.Projects) > 0 {
+		for _, p := range req.Projects {
+			url += fmt.Sprintf("&projectId=%s", p)
+		}
+	}
+	resp, err := c.doRequest(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("lethe returned %d", resp.StatusCode)
+	}
+
+	var result SearchResult
+	if err := c.decodeJSON(resp, &result); err != nil {
+		return nil, fmt.Errorf("decode search: %w", err)
+	}
+	return &result, nil
 }
 
 // GetEvent retrieves a single event by ID.
