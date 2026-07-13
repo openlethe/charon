@@ -110,14 +110,13 @@ func runObol() error {
 			os.Exit(1)
 		}
 		
-		// Parse optional flags
+		// Parse flags - flags can be anywhere, principal is first non-flag
 		expires := 30 * 24 * time.Hour // default 30 days
-		principalID := os.Args[len(os.Args)-1]
+		var principalID string
 		
-		for i := 3; i < len(os.Args)-1; i++ {
-			switch os.Args[i] {
-			case "--expires":
-				if i+1 >= len(os.Args)-1 {
+		for i := 3; i < len(os.Args); i++ {
+			if os.Args[i] == "--expires" {
+				if i+1 >= len(os.Args) {
 					fmt.Fprintln(os.Stderr, "Missing value for --expires")
 					os.Exit(1)
 				}
@@ -127,8 +126,19 @@ func runObol() error {
 					fmt.Fprintf(os.Stderr, "Invalid duration: %v\n", err)
 					os.Exit(1)
 				}
+				if d <= 0 {
+					fmt.Fprintln(os.Stderr, "Expiry must be positive")
+					os.Exit(1)
+				}
 				expires = d
+			} else if !strings.HasPrefix(os.Args[i], "-") && principalID == "" {
+				principalID = os.Args[i]
 			}
+		}
+		
+		if principalID == "" {
+			fmt.Fprintln(os.Stderr, "Missing principal ID")
+			os.Exit(1)
 		}
 		
 		o, err := obolSvc.Mint(ctx, principalID, cfg.PublicURL, expires)
