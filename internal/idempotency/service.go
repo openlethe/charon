@@ -71,6 +71,18 @@ func (s *Service) Check(ctx context.Context, principalID, operation, key string,
 	// Compute hash of current request
 	expectedHash := hashRequestRaw(requestBody)
 
+	// Backward compatibility: accept both hex-encoded and raw hashes
+	storedHash := hex.EncodeToString(reqHash)
+	decodedHash, decodeErr := hex.DecodeString(storedHash)
+	if decodeErr == nil && len(decodedHash) == sha256.Size {
+		// Stored value is valid hex of raw hash
+		return &CheckResult{
+			Found:    true,
+			Matching: string(decodedHash) == string(expectedHash),
+			Record:   &r,
+		}, nil
+	}
+
 	return &CheckResult{
 		Found:    true,
 		Matching: string(reqHash) == string(expectedHash),

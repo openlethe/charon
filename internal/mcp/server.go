@@ -453,9 +453,20 @@ func (s *Server) handleWrite(ctx context.Context, request mcp.CallToolRequest) (
 	}
 
 	// Store idempotency record
-	_, err = s.storeIdempotency(ctx, principal.ID, "memory_write", idempotencyKey, args, "success", event.ID)
+	existingIdem, err := s.storeIdempotency(ctx, principal.ID, "memory_write", idempotencyKey, args, "success", event.ID)
 	if err != nil {
 		return nil, err
+	}
+	if existingIdem != nil {
+		// Lost the race - return the winner's result
+		data, _ := json.MarshalIndent(map[string]interface{}{
+			"event_id": existingIdem.ResultingResourceID,
+			"project":  event.Project,
+			"status":   "created",
+			"existing": true,
+		}, "", "  ")
+		s.recordLedger(reqID, principal, "memory_write", []string{project}, "success", time.Since(start))
+		return mcp.NewToolResultText(string(data)), nil
 	}
 
 	data, _ := json.MarshalIndent(map[string]interface{}{
