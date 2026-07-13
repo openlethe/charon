@@ -68,6 +68,7 @@ func FromEnv() (*Config, error) {
 		AdminHTTP:      getEnv("CHARON_ADMIN_HTTP", "127.0.0.1:18486"),
 		Upstream:       getEnv("CHARON_UPSTREAM", "http://localhost:18483"),
 		PublicURL:      os.Getenv("CHARON_PUBLIC_URL"),
+		OAuthClientID:  getEnv("CHARON_OAUTH_CLIENT_ID", "chatgpt-mcp"),
 		DataDir:        getEnv("CHARON_DATA_DIR", "./data"),
 		LetheAPIKey:    os.Getenv("LETHE_API_KEY"),
 		HMACKey:        os.Getenv("CHARON_HMAC_KEY"),

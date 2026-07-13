@@ -28,6 +28,7 @@ services:
       - CHARON_HMAC_KEY=${CHARON_HMAC_KEY:-}
       - CHARON_DATA_DIR=/data
       - CHARON_AUTH_MODE=${CHARON_AUTH_MODE:-obol}
+      - CHARON_OAUTH_CLIENT_ID=${CHARON_OAUTH_CLIENT_ID:-chatgpt-mcp}
       # Auto-bootstrap (optional)
       - CHARON_AUTO_USER=${CHARON_AUTO_USER:-}
       - CHARON_AUTO_PERMISSION=${CHARON_AUTO_PERMISSION:-propose}

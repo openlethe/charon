@@ -73,7 +73,11 @@ type AccessTokenClaims struct {
 }
 
 // NewService creates an OAuth service.
-func NewService(hmacKey []byte, issuer, clientID string) *Service {
+func NewService(hmacKey []byte, issuer, clientID string) (*Service, error) {
+	if len(hmacKey) < 32 {
+		return nil, fmt.Errorf("HMAC key must be at least 32 bytes for HS256, got %d", len(hmacKey))
+	}
+
 	s := &Service{
 		hmacKey:     hmacKey,
 		issuer:      issuer,
@@ -92,7 +96,17 @@ func NewService(hmacKey []byte, issuer, clientID string) *Service {
 		Public:       true,
 	}
 
-	return s
+	// Register the configured client ID if different from default
+	if clientID != "" && clientID != "chatgpt-mcp" {
+		s.clients[clientID] = &Client{
+			ID:           clientID,
+			Name:         "Configured MCP Client",
+			RedirectURIs: []string{},
+			Public:       true,
+		}
+	}
+
+	return s, nil
 }
 
 // RegisterClient adds a new OAuth client.

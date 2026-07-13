@@ -47,7 +47,11 @@ func NewServer(cfg *config.Config, db *store.DB, logger *slog.Logger) (*Server, 
 	// Initialize OAuth service with HMAC key and client ID
 	var oauthSvc *oauth.Service
 	if cfg.HMACKey != "" {
-		oauthSvc = oauth.NewService([]byte(cfg.HMACKey), cfg.PublicURL, cfg.OAuthClientID)
+		var err error
+		oauthSvc, err = oauth.NewService([]byte(cfg.HMACKey), cfg.PublicURL, cfg.OAuthClientID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize OAuth service: %w", err)
+		}
 	}
 
 	return &Server{

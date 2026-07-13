@@ -6,16 +6,65 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
+	"time"
 )
 
 // Handlers provides HTTP handlers for OAuth 2.0 endpoints.
 type Handlers struct {
-	service *Service
+	service     *Service
+	rateLimiter *RateLimiter
+}
+
+// RateLimiter provides simple per-client rate limiting for the token endpoint.
+type RateLimiter struct {
+	mu       sync.Mutex
+	attempts map[string][]time.Time
+	window   time.Duration
+	maxReqs  int
+}
+
+// NewRateLimiter creates a rate limiter.
+func NewRateLimiter(window time.Duration, maxRequests int) *RateLimiter {
+	return &RateLimiter{
+		attempts: make(map[string][]time.Time),
+		window:   window,
+		maxReqs:  maxRequests,
+	}
+}
+
+// Allow checks if a client ID is within rate limits.
+func (rl *RateLimiter) Allow(clientID string) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	now := time.Now()
+	cutoff := now.Add(-rl.window)
+
+	// Filter out old attempts
+	var recent []time.Time
+	for _, t := range rl.attempts[clientID] {
+		if t.After(cutoff) {
+			recent = append(recent, t)
+		}
+	}
+
+	if len(recent) >= rl.maxReqs {
+		rl.attempts[clientID] = recent
+		return false
+	}
+
+	recent = append(recent, now)
+	rl.attempts[clientID] = recent
+	return true
 }
 
 // NewHandlers creates OAuth HTTP handlers.
 func NewHandlers(service *Service) *Handlers {
-	return &Handlers{service: service}
+	return &Handlers{
+		service:     service,
+		rateLimiter: NewRateLimiter(1*time.Minute, 60), // 60 requests per minute per client
+	}
 }
 
 // RegisterRoutes registers OAuth routes on the provided mux.
@@ -77,6 +126,25 @@ func (h *Handlers) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate redirect_uri
+	if redirectURI == "" {
+		http.Error(w, "missing redirect_uri", http.StatusBadRequest)
+		return
+	}
+	if len(client.RedirectURIs) > 0 {
+		validRedirect := false
+		for _, uri := range client.RedirectURIs {
+			if redirectURI == uri {
+				validRedirect = true
+				break
+			}
+		}
+		if !validRedirect {
+			http.Error(w, "invalid redirect_uri", http.StatusBadRequest)
+			return
+		}
+	}
+
 	// Validate resource parameter if present
 	if resource != "" {
 		expectedResource := h.service.issuer + "/mcp"
@@ -90,6 +158,12 @@ func (h *Handlers) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	// For public clients, PKCE is required
 	if client.Public && codeChallenge == "" {
 		h.redirectError(w, r, redirectURI, "invalid_request", "PKCE required for public clients", state)
+		return
+	}
+
+	// For public clients, state is required for CSRF protection
+	if client.Public && state == "" {
+		h.redirectError(w, r, redirectURI, "invalid_request", "state parameter required for public clients", state)
 		return
 	}
 
@@ -159,6 +233,12 @@ func (h *Handlers) handleToken(w http.ResponseWriter, r *http.Request) {
 	client := h.service.GetClient(clientID)
 	if client == nil {
 		WriteErrorResponse(w, "invalid_client", "unknown client", http.StatusUnauthorized)
+		return
+	}
+
+	// Rate limit token endpoint per client
+	if !h.rateLimiter.Allow(clientID) {
+		WriteErrorResponse(w, "slow_down", "rate limit exceeded", http.StatusTooManyRequests)
 		return
 	}
 
