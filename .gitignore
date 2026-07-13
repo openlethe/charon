@@ -16,3 +16,5 @@ charon-data/.secrets
 # OS
 .DS_Store
 Thumbs.db
+.env
+.secrets
