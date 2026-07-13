@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -105,17 +106,22 @@ type CreateEventRequest struct {
 // SearchEvents queries Lethe for events.
 func (c *Client) SearchEvents(ctx context.Context, req SearchRequest) (*SearchResult, error) {
 	// Lethe v0.4 uses GET /api/events/search with query params
-	url := fmt.Sprintf("/api/events/search?q=%s&limit=%d", req.Query, req.Limit)
-	if len(req.EventTypes) > 0 {
-		for _, et := range req.EventTypes {
-			url += fmt.Sprintf("&eventType=%s", et)
-		}
+	params := url.Values{}
+	params.Set("q", req.Query)
+	if req.Limit > 0 {
+		params.Set("limit", fmt.Sprintf("%d", req.Limit))
 	}
-	if len(req.Projects) > 0 {
-		for _, p := range req.Projects {
-			url += fmt.Sprintf("&projectId=%s", p)
-		}
+	for _, et := range req.EventTypes {
+		params.Add("eventType", et)
 	}
+	for _, p := range req.Projects {
+		params.Add("projectId", p)
+	}
+	for _, t := range req.Tags {
+		params.Add("tag", t)
+	}
+	url := "/api/events/search?" + params.Encode()
+
 	resp, err := c.doRequest(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
