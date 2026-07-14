@@ -36,6 +36,14 @@ type Config struct {
 	// OAuthClientID is the client_id advertised in OAuth protected resource metadata.
 	OAuthClientID string `env:"CHARON_OAUTH_CLIENT_ID" envDefault:"chatgpt-mcp"`
 
+	// OAuthDefaultUserID is the principal ID used for auto-approved OAuth flows.
+	// Defaults to "chatgpt" for backward compatibility with ChatGPT MCP.
+	OAuthDefaultUserID string `env:"CHARON_OAUTH_DEFAULT_USER" envDefault:"chatgpt"`
+
+	// OAuthRedirectURIs is the explicit allowlist for authorization-code redirects.
+	// A trailing * allows a trusted path prefix, such as ChatGPT's per-app callback ID.
+	OAuthRedirectURIs []string `env:"CHARON_OAUTH_REDIRECT_URIS"`
+
 	// DataDir is the directory for SQLite and other persistent data.
 	DataDir string `env:"CHARON_DATA_DIR" envDefault:"./data"`
 
@@ -63,19 +71,21 @@ type Config struct {
 // Fail-closed: missing required secrets prevent startup.
 func FromEnv() (*Config, error) {
 	cfg := &Config{
-		Mode:           ModeDirect,
-		HTTP:           getEnv("CHARON_HTTP", ":18484"),
-		AdminHTTP:      getEnv("CHARON_ADMIN_HTTP", "127.0.0.1:18486"),
-		Upstream:       getEnv("CHARON_UPSTREAM", "http://localhost:18483"),
-		PublicURL:      os.Getenv("CHARON_PUBLIC_URL"),
-		OAuthClientID:  getEnv("CHARON_OAUTH_CLIENT_ID", "chatgpt-mcp"),
-		DataDir:        getEnv("CHARON_DATA_DIR", "./data"),
-		LetheAPIKey:    os.Getenv("LETHE_API_KEY"),
-		HMACKey:        os.Getenv("CHARON_HMAC_KEY"),
-		MaxResultBytes: 1048576,
-		MaxResultCount: 100,
-		RequestTimeout: 10 * time.Second,
-		AuthMode:       getEnv("CHARON_AUTH_MODE", "obol"),
+		Mode:               ModeDirect,
+		HTTP:               getEnv("CHARON_HTTP", ":18484"),
+		AdminHTTP:          getEnv("CHARON_ADMIN_HTTP", "127.0.0.1:18486"),
+		Upstream:           getEnv("CHARON_UPSTREAM", "http://localhost:18483"),
+		PublicURL:          os.Getenv("CHARON_PUBLIC_URL"),
+		OAuthClientID:      getEnv("CHARON_OAUTH_CLIENT_ID", "chatgpt-mcp"),
+		OAuthDefaultUserID: getEnv("CHARON_OAUTH_DEFAULT_USER", "chatgpt"),
+		OAuthRedirectURIs:  splitCSV(os.Getenv("CHARON_OAUTH_REDIRECT_URIS")),
+		DataDir:            getEnv("CHARON_DATA_DIR", "./data"),
+		LetheAPIKey:        os.Getenv("LETHE_API_KEY"),
+		HMACKey:            os.Getenv("CHARON_HMAC_KEY"),
+		MaxResultBytes:     1048576,
+		MaxResultCount:     100,
+		RequestTimeout:     10 * time.Second,
+		AuthMode:           getEnv("CHARON_AUTH_MODE", "obol"),
 	}
 
 	if cfg.Mode != ModeDirect {
@@ -97,12 +107,25 @@ func FromEnv() (*Config, error) {
 	if cfg.PublicURL == "" && cfg.AuthMode == "oauth" {
 		return nil, errors.New("CHARON_PUBLIC_URL is required for OAuth mode")
 	}
+	if cfg.AuthMode == "oauth" && len(cfg.OAuthRedirectURIs) == 0 {
+		return nil, errors.New("CHARON_OAUTH_REDIRECT_URIS is required for OAuth mode")
+	}
 
 	if err := validateAdminBind(cfg.AdminHTTP); err != nil {
 		return nil, fmt.Errorf("invalid admin bind: %w", err)
 	}
 
 	return cfg, nil
+}
+
+func splitCSV(value string) []string {
+	var result []string
+	for _, item := range strings.Split(value, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			result = append(result, item)
+		}
+	}
+	return result
 }
 
 func validateAdminBind(addr string) error {

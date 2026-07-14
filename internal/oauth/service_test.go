@@ -45,7 +45,7 @@ func TestPublicClientCredentialRejection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewService failed: %v", err)
 	}
-	h := NewHandlers(s)
+	h := NewHandlers(s, "", []string{"https://example.com/callback"})
 
 	mux := http.NewServeMux()
 	h.RegisterRoutes(mux)
@@ -128,7 +128,7 @@ func TestConfidentialClientCredentials(t *testing.T) {
 		Secret: "secret123",
 		Public: false,
 	})
-	h := NewHandlers(s)
+	h := NewHandlers(s, "", []string{"https://example.com/callback"})
 
 	mux := http.NewServeMux()
 	h.RegisterRoutes(mux)
@@ -277,14 +277,14 @@ func TestConfiguredClientID(t *testing.T) {
 	}
 }
 
-// TestAutoRegistration verifies that unknown client IDs are auto-registered
-// as public clients (MCP dynamic client registration simplified).
-func TestAutoRegistration(t *testing.T) {
+// TestUnknownClientRejected verifies that the auto-approved principal flow is
+// limited to the explicitly configured client.
+func TestUnknownClientRejected(t *testing.T) {
 	s, err := NewService([]byte("test-key-32-bytes-long-for-hs256"), "https://example.com", "chatgpt-mcp")
 	if err != nil {
 		t.Fatalf("NewService failed: %v", err)
 	}
-	h := NewHandlers(s)
+	h := NewHandlers(s, "", []string{"https://example.com/callback"})
 
 	mux := http.NewServeMux()
 	h.RegisterRoutes(mux)
@@ -294,19 +294,27 @@ func TestAutoRegistration(t *testing.T) {
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
 
-	// Should redirect with code (auto-registered)
-	if rr.Code != http.StatusFound {
-		t.Fatalf("expected 302 redirect, got %d: %s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d: %s", rr.Code, rr.Body.String())
 	}
-
-	location := rr.Header().Get("Location")
-	if !strings.Contains(location, "code=") {
-		t.Errorf("expected redirect with code, got: %s", location)
+	if s.GetClient("chatgpt-generated-id") != nil {
+		t.Error("unknown client must not be registered")
 	}
+}
 
-	// Verify the client was registered
-	if s.GetClient("chatgpt-generated-id") == nil {
-		t.Error("auto-registered client should exist")
+func TestRedirectAllowlist(t *testing.T) {
+	if !redirectAllowed("https://chatgpt.com/connector/oauth/app-123", []string{"https://chatgpt.com/connector/oauth/*"}) {
+		t.Fatal("expected ChatGPT callback prefix to be allowed")
+	}
+	for _, candidate := range []string{
+		"https://evil.example/callback",
+		"https://chatgpt.com.evil.example/connector/oauth/app-123",
+		"https://chatgpt.com/other/path",
+		"https://chatgpt.com@evil.example/connector/oauth/app-123",
+	} {
+		if redirectAllowed(candidate, []string{"https://chatgpt.com/connector/oauth/*"}) {
+			t.Errorf("unexpectedly allowed %q", candidate)
+		}
 	}
 }
 
@@ -316,7 +324,7 @@ func TestRateLimiting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewService failed: %v", err)
 	}
-	h := NewHandlers(s)
+	h := NewHandlers(s, "", []string{"https://example.com/callback"})
 
 	mux := http.NewServeMux()
 	h.RegisterRoutes(mux)

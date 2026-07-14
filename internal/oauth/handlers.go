@@ -15,6 +15,8 @@ type Handlers struct {
 	service           *Service
 	rateLimiter       *RateLimiter
 	globalRateLimiter *RateLimiter // Prevents auto-registration bypass
+	defaultUserID     string
+	allowedRedirects  []string
 }
 
 // RateLimiter provides simple per-client rate limiting for the token endpoint.
@@ -61,9 +63,11 @@ func (rl *RateLimiter) Allow(clientID string) bool {
 }
 
 // NewHandlers creates OAuth HTTP handlers.
-func NewHandlers(service *Service) *Handlers {
+func NewHandlers(service *Service, defaultUserID string, allowedRedirects []string) *Handlers {
 	return &Handlers{
 		service:           service,
+		defaultUserID:     defaultUserID,
+		allowedRedirects:  append([]string(nil), allowedRedirects...),
 		rateLimiter:       NewRateLimiter(1*time.Minute, 60),  // Per client
 		globalRateLimiter: NewRateLimiter(1*time.Minute, 120), // Global cap across all clients
 	}
@@ -122,26 +126,26 @@ func (h *Handlers) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Charon maps this flow to a real database principal, so it must never
+	// auto-register arbitrary clients. Only the configured MCP client may use
+	// the auto-approved authorization path.
+	if clientID != h.service.OAuthClientID() {
+		http.Error(w, "invalid client_id", http.StatusUnauthorized)
+		return
+	}
 	client := h.service.GetClient(clientID)
 	if client == nil {
-		// Auto-register unknown clients as public clients (MCP dynamic registration simplified)
-		// Cap at 1000 auto-registered clients to prevent unbounded memory growth
-		if h.service.AutoClientCount() >= 1000 {
-				http.Error(w, "client registration limit reached", http.StatusServiceUnavailable)
-				return
-		}
-		client = &Client{
-			ID:           clientID,
-			Name:         clientID,
-			RedirectURIs: []string{},
-			Public:       true,
-		}
-		h.service.RegisterClient(client)
+		http.Error(w, "invalid client_id", http.StatusUnauthorized)
+		return
 	}
 
 	// Validate redirect_uri
 	if redirectURI == "" {
 		http.Error(w, "missing redirect_uri", http.StatusBadRequest)
+		return
+	}
+	if !redirectAllowed(redirectURI, h.allowedRedirects) {
+		http.Error(w, "invalid redirect_uri", http.StatusBadRequest)
 		return
 	}
 	if len(client.RedirectURIs) > 0 {
@@ -192,7 +196,10 @@ func (h *Handlers) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	// Generate authorization code
 	// For a real implementation, we'd authenticate the user here.
 	// For this simplified version, we auto-approve with a default user.
-	userID := "chatgpt" // Default user for ChatGPT MCP
+	userID := h.defaultUserID
+	if userID == "" {
+		userID = "chatgpt" // Fallback default user for ChatGPT MCP
+	}
 	code, err := h.service.GenerateAuthCode(clientID, userID, redirectURI, codeChallenge, codeChallengeMethod)
 	if err != nil {
 		h.redirectError(w, r, redirectURI, "server_error", err.Error(), state)
@@ -215,6 +222,25 @@ func (h *Handlers) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Location", redirectURL.String())
 	w.WriteHeader(http.StatusFound)
+}
+
+func redirectAllowed(candidate string, allowlist []string) bool {
+	parsed, err := url.Parse(candidate)
+	if err != nil || parsed.Scheme != "https" && parsed.Scheme != "http" || parsed.Host == "" || parsed.User != nil {
+		return false
+	}
+	for _, allowed := range allowlist {
+		if strings.HasSuffix(allowed, "*") {
+			if strings.HasPrefix(candidate, strings.TrimSuffix(allowed, "*")) {
+				return true
+			}
+			continue
+		}
+		if candidate == allowed {
+			return true
+		}
+	}
+	return false
 }
 
 // handleToken handles the OAuth 2.0 token endpoint.

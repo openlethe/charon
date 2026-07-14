@@ -1,38 +1,24 @@
-version: "3.8"
-
 services:
-  lethe:
-    image: lethe:local-v0.4
-    environment:
-      - LETHE_API_KEY=${LETHE_API_KEY}
-    volumes:
-      - ./lethe-data:/data
-    networks:
-      - styx
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "sh", "-c", "wget -qO- --header=\"Authorization: Bearer $${LETHE_API_KEY}\" http://localhost:18483/api/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-
   charon:
     build: .
     environment:
       - CHARON_MODE=direct
       - CHARON_HTTP=:18484
       - CHARON_ADMIN_HTTP=/tmp/charon-admin.sock
-      - CHARON_UPSTREAM=http://lethe:18483
+      - CHARON_UPSTREAM=${CHARON_UPSTREAM:-http://host.docker.internal:18483}
       - CHARON_PUBLIC_URL=${CHARON_PUBLIC_URL:-http://localhost:18484}
       - LETHE_API_KEY=${LETHE_API_KEY}
       - CHARON_HMAC_KEY=${CHARON_HMAC_KEY:-}
       - CHARON_DATA_DIR=/data
       - CHARON_AUTH_MODE=${CHARON_AUTH_MODE:-obol}
       - CHARON_OAUTH_CLIENT_ID=${CHARON_OAUTH_CLIENT_ID:-chatgpt-mcp}
+      - CHARON_OAUTH_DEFAULT_USER=${CHARON_OAUTH_DEFAULT_USER:-}
+      - CHARON_OAUTH_REDIRECT_URIS=${CHARON_OAUTH_REDIRECT_URIS:-}
       # Auto-bootstrap (optional)
       - CHARON_AUTO_USER=${CHARON_AUTO_USER:-}
-      - CHARON_AUTO_PERMISSION=${CHARON_AUTO_PERMISSION:-propose}
+      - CHARON_AUTO_PERMISSION=${CHARON_AUTO_PERMISSION:-readonly}
       - CHARON_AUTO_PROJECT=${CHARON_AUTO_PROJECT:-default}
+      - CHARON_AUTO_PROJECTS=${CHARON_AUTO_PROJECTS:-}
       - CHARON_AUTO_EXPIRES=${CHARON_AUTO_EXPIRES:-7d}
     volumes:
       - ./charon-data:/data
@@ -40,13 +26,12 @@ services:
       - ./workspace:/workspace:rw
       - ./code:/code:ro
     networks:
-      - styx
       - edge
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "18484:18484"
     restart: unless-stopped
-    depends_on:
-      - lethe
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:18484/health"]
       interval: 30s
@@ -54,6 +39,4 @@ services:
       retries: 3
 
 networks:
-  styx:
-    internal: true
   edge: {}

@@ -32,6 +32,12 @@ type Service struct {
 
 	// Access tokens in memory (for validation)
 	tokens map[string]*tokenRecord
+
+	// scopeLookup is called during token exchange to resolve the principal's
+	// actual scopes from the database. If nil, a default set is used.
+	// Returns the exact reconciled scopes or an error. Callers that configure a
+	// lookup should fail closed when the principal is missing.
+	scopeLookup func(userID string) ([]string, error)
 }
 
 // Client represents an OAuth 2.0 client registration.
@@ -40,19 +46,20 @@ type Client struct {
 	Name         string
 	Secret       string // For confidential clients
 	RedirectURIs []string
-	Public       bool   // true = public client (no secret, PKCE required)
+	Public       bool // true = public client (no secret, PKCE required)
 }
 
 // authCode holds authorization code data.
 type authCode struct {
-	Code        string
-	ClientID    string
-	UserID      string
-	RedirectURI string
+	Code          string
+	ClientID      string
+	UserID        string
+	RedirectURI   string
 	PKCEChallenge string
-	PKCEMethod  string
-	ExpiresAt   time.Time
-	Used        bool
+	PKCEMethod    string
+	ExpiresAt     time.Time
+	Used          bool
+	Pending       bool // true while exchange is in progress (prevents concurrent use)
 }
 
 // tokenRecord holds access token metadata.
@@ -136,17 +143,27 @@ func (s *Service) AutoClientCount() int {
 	return count
 }
 
+// SetScopeLookup configures a function that looks up a principal's scopes
+// from the database. If set, ExchangeAuthCode uses the returned scopes
+// instead of the hardcoded defaults.
+func (s *Service) SetScopeLookup(fn func(userID string) ([]string, error)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.scopeLookup = fn
+}
+
 // AuthorizationServerMetadata returns the OAuth 2.0 Authorization Server Metadata.
+
 func (s *Service) AuthorizationServerMetadata() map[string]interface{} {
 	meta := map[string]interface{}{
-		"issuer":                 s.issuer,
-		"authorization_endpoint": s.issuer + "/oauth/authorize",
-		"token_endpoint":         s.issuer + "/oauth/token",
+		"issuer":                                s.issuer,
+		"authorization_endpoint":                s.issuer + "/oauth/authorize",
+		"token_endpoint":                        s.issuer + "/oauth/token",
 		"token_endpoint_auth_methods_supported": []string{"none", "client_secret_basic", "client_secret_post"},
 		"response_types_supported":              []string{"code"},
 		"grant_types_supported":                 []string{"authorization_code", "client_credentials"},
 		"code_challenge_methods_supported":      []string{"S256"},
-		"scopes_supported":                        []string{"memory.read", "memory.search", "memory.propose", "memory.write"},
+		"scopes_supported":                      []string{"memory.read", "memory.search", "thread.read", "memory.propose", "memory.write", "proposal.review"},
 	}
 	if s.clientID != "" {
 		meta["client_id"] = s.clientID
@@ -159,7 +176,7 @@ func (s *Service) ProtectedResourceMetadata() map[string]interface{} {
 	meta := map[string]interface{}{
 		"resource":              s.issuer + "/mcp",
 		"authorization_servers": []string{s.issuer},
-		"scopes_supported":      []string{"memory.read", "memory.search", "memory.propose", "memory.write"},
+		"scopes_supported":      []string{"memory.read", "memory.search", "thread.read", "memory.propose", "memory.write", "proposal.review"},
 	}
 	if s.clientID != "" {
 		meta["client_id"] = s.clientID
@@ -213,7 +230,7 @@ func (s *Service) GenerateAuthCode(clientID, userID, redirectURI, pkceChallenge,
 func (s *Service) ExchangeAuthCode(code, clientID, redirectURI, codeVerifier string) (*TokenResponse, error) {
 	s.mu.Lock()
 	ac, ok := s.authCodes[code]
-	if !ok || ac.Used || time.Now().After(ac.ExpiresAt) {
+	if !ok || ac.Used || ac.Pending || time.Now().After(ac.ExpiresAt) {
 		s.mu.Unlock()
 		return nil, fmt.Errorf("invalid authorization code")
 	}
@@ -251,14 +268,60 @@ func (s *Service) ExchangeAuthCode(code, clientID, redirectURI, codeVerifier str
 		}
 	}
 
-	ac.Used = true
+	// Reserve the code atomically to prevent concurrent exchange
+	ac.Pending = true
 	s.mu.Unlock()
 
+	// Resolve scopes for the token. Use the lookup if available; if the
+	// principal is not found, fall back to the default set for backward
+	// compatibility. Fail closed on lookup errors.
+	//
+	// IMPORTANT: Authorization code exchange always caps scopes to a safe
+	// subset. Since /oauth/authorize auto-approves without authenticating
+	// the real user and auto-registers unknown public clients, we must not
+	// mint elevated database scopes (e.g. memory.write, proposal.review)
+	// into bearer tokens for arbitrary callers.
+	var scopes []string
+	var lookupErr error
+	if s.scopeLookup != nil {
+		scopes, lookupErr = s.scopeLookup(ac.UserID)
+		if lookupErr != nil {
+			// Clear pending so the code can be retried on transient failures
+			s.mu.Lock()
+			ac.Pending = false
+			s.mu.Unlock()
+			return nil, fmt.Errorf("scope lookup failed: %w", lookupErr)
+		}
+		// Cap to safe subset — never write/review via auto-approve
+		safeOnly := make([]string, 0, len(scopes))
+		for _, sc := range scopes {
+			switch sc {
+			case "memory.read", "memory.search", "thread.read", "memory.propose":
+				safeOnly = append(safeOnly, sc)
+			}
+		}
+		scopes = safeOnly
+	}
+	if scopes == nil {
+		// Fallback for backward compatibility: only safe scopes
+		scopes = []string{"memory.read", "memory.search", "thread.read"}
+	}
+
 	// Generate access token
-	token, err := s.GenerateAccessToken(ac.UserID, clientID, []string{"memory.read", "memory.search", "memory.propose"})
+	token, err := s.GenerateAccessToken(ac.UserID, clientID, scopes)
 	if err != nil {
+		// Clear pending so the code can be retried on transient failures
+		s.mu.Lock()
+		ac.Pending = false
+		s.mu.Unlock()
 		return nil, fmt.Errorf("failed to generate token: %w", err)
 	}
+
+	// Mark code as used only after successful token generation
+	s.mu.Lock()
+	ac.Used = true
+	ac.Pending = false
+	s.mu.Unlock()
 
 	return &TokenResponse{
 		AccessToken: token,
@@ -345,11 +408,11 @@ func (s *Service) ValidateAccessToken(tokenString string) (*AccessTokenClaims, e
 
 // TokenResponse represents the OAuth 2.0 token endpoint response.
 type TokenResponse struct {
-	AccessToken string `json:"access_token"`
-	TokenType   string `json:"token_type"`
-	ExpiresIn   int    `json:"expires_in,omitempty"`
+	AccessToken  string `json:"access_token"`
+	TokenType    string `json:"token_type"`
+	ExpiresIn    int    `json:"expires_in,omitempty"`
 	RefreshToken string `json:"refresh_token,omitempty"`
-	Scope       string `json:"scope,omitempty"`
+	Scope        string `json:"scope,omitempty"`
 }
 
 // ErrorResponse represents an OAuth 2.0 error response.

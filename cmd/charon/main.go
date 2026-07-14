@@ -74,7 +74,7 @@ func runServe() error {
 
 	// Print OAuth configuration for easy client setup
 	if cfg.AuthMode == "oauth" {
-		logger.Info("oauth configuration", 
+		logger.Info("oauth configuration",
 			"client_id", cfg.OAuthClientID,
 			"metadata_url", cfg.PublicURL+"/.well-known/oauth-protected-resource",
 			"authorize_url", cfg.PublicURL+"/oauth/authorize",
@@ -119,11 +119,11 @@ func runObol() error {
 			fmt.Fprintln(os.Stderr, "  --expires <duration>  Token expiry duration (e.g., 7d, 1h, 30m). Default: 30d")
 			os.Exit(1)
 		}
-		
+
 		// Parse flags - flags can be anywhere, principal is first non-flag
 		expires := 30 * 24 * time.Hour // default 30 days
 		var principalID string
-		
+
 		for i := 3; i < len(os.Args); i++ {
 			if os.Args[i] == "--expires" {
 				if i+1 >= len(os.Args) {
@@ -148,12 +148,12 @@ func runObol() error {
 				os.Exit(1)
 			}
 		}
-		
+
 		if principalID == "" {
 			fmt.Fprintln(os.Stderr, "Missing principal ID")
 			os.Exit(1)
 		}
-		
+
 		o, err := obolSvc.Mint(ctx, principalID, cfg.PublicURL, expires)
 		if err != nil {
 			return err
@@ -201,7 +201,7 @@ func runObol() error {
 
 func runPrincipal() error {
 	if len(os.Args) < 3 {
-		fmt.Fprintln(os.Stderr, "Usage: charon principal <create|grant-project|grant-scope>")
+		fmt.Fprintln(os.Stderr, "Usage: charon principal <create|grant-project|grant-scope|reconcile>")
 		os.Exit(1)
 	}
 
@@ -220,6 +220,31 @@ func runPrincipal() error {
 	defer db.Close()
 
 	switch sub {
+	case "reconcile":
+		if len(os.Args) < 6 {
+			fmt.Fprintln(os.Stderr, "Usage: charon principal reconcile <name> <readonly|propose|write> <project[,project...]> ")
+			os.Exit(1)
+		}
+		name := os.Args[3]
+		permission := os.Args[4]
+		projects := splitNonEmpty(os.Args[5])
+		if len(projects) == 0 {
+			return fmt.Errorf("at least one project grant is required")
+		}
+		scopes, err := scopesForPermission(permission)
+		if err != nil {
+			return err
+		}
+		principalID, created, err := db.ReconcilePrincipal(ctx, name, projects, scopes)
+		if err != nil {
+			return err
+		}
+		action := "updated"
+		if created {
+			action = "created"
+		}
+		fmt.Printf("Reconciled principal: %s (%s)\n", principalID, action)
+
 	case "create":
 		if len(os.Args) < 4 {
 			fmt.Fprintln(os.Stderr, "Usage: charon principal create <name>")
@@ -274,6 +299,37 @@ func runPrincipal() error {
 	}
 
 	return nil
+}
+
+func splitNonEmpty(value string) []string {
+	var result []string
+	seen := make(map[string]struct{})
+	for _, item := range strings.Split(value, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		result = append(result, item)
+	}
+	return result
+}
+
+func scopesForPermission(permission string) ([]string, error) {
+	readonly := []string{"memory.search", "memory.read", "thread.read"}
+	switch permission {
+	case "readonly":
+		return readonly, nil
+	case "propose":
+		return append(readonly, "memory.propose"), nil
+	case "write":
+		return append(readonly, "memory.propose", "memory.write", "proposal.review"), nil
+	default:
+		return nil, fmt.Errorf("unknown permission %q: expected readonly, propose, or write", permission)
+	}
 }
 
 func runLedger() error {
@@ -400,11 +456,11 @@ func parseDuration(s string) (time.Duration, error) {
 	if len(s) == 0 {
 		return 0, fmt.Errorf("empty duration")
 	}
-	
+
 	// Check for suffix
 	var unit time.Duration
 	var numStr string
-	
+
 	switch {
 	case strings.HasSuffix(s, "d"):
 		unit = 24 * time.Hour
@@ -419,11 +475,11 @@ func parseDuration(s string) (time.Duration, error) {
 		// Try standard Go duration parsing
 		return time.ParseDuration(s)
 	}
-	
+
 	num, err := strconv.Atoi(numStr)
 	if err != nil {
 		return 0, fmt.Errorf("invalid number: %w", err)
 	}
-	
+
 	return time.Duration(num) * unit, nil
 }

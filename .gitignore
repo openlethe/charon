@@ -6,8 +6,9 @@ charon.exe
 # Build output
 /dist/
 
-# Generated secrets
-charon-data/.secrets
+# Runtime state (never publish memory, auth metadata, WALs, or generated secrets)
+/charon-data/
+/lethe-data/
 
 # IDE
 .vscode/

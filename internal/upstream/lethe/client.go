@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"time"
 )
 
@@ -26,6 +27,9 @@ func NewClient(baseURL, apiKey string, timeout time.Duration, maxBody int64) *Cl
 		apiKey:  apiKey,
 		httpClient: &http.Client{
 			Timeout: timeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
 		maxBody: maxBody,
 	}
@@ -33,13 +37,15 @@ func NewClient(baseURL, apiKey string, timeout time.Duration, maxBody int64) *Cl
 
 // Event represents a Lethe memory event.
 type Event struct {
-	ID        string                 `json:"id"`
-	Project   string                 `json:"project"`
-	Type      string                 `json:"type"`
+	ID        string                 `json:"event_id"`
+	SessionID *string                `json:"session_id,omitempty"`
+	Project   string                 `json:"project_id"`
+	Type      string                 `json:"event_type"`
 	Kind      string                 `json:"kind,omitempty"`
 	Content   string                 `json:"content"`
 	Tags      interface{}            `json:"tags,omitempty"`
 	Metadata  map[string]interface{} `json:"metadata,omitempty"`
+	ThreadID  string                 `json:"thread_id,omitempty"`
 	CreatedAt string                 `json:"created_at"`
 }
 
@@ -96,8 +102,8 @@ func (c *Client) CreateEvent(ctx context.Context, req CreateEventRequest) (*Even
 
 // CreateEventRequest is used to create a new Lethe event.
 type CreateEventRequest struct {
-	Project string   `json:"project"`
-	Type    string   `json:"type"`
+	Project string   `json:"project_id"`
+	Type    string   `json:"event_type"`
 	Kind    string   `json:"kind,omitempty"`
 	Content string   `json:"content"`
 	Tags    []string `json:"tags,omitempty"`
@@ -106,20 +112,70 @@ type CreateEventRequest struct {
 
 // SearchEvents queries Lethe for events.
 func (c *Client) SearchEvents(ctx context.Context, req SearchRequest) (*SearchResult, error) {
-	// Lethe v0.4 uses GET /api/events/search with query params
+	if len(req.Tags) > 1 {
+		return nil, fmt.Errorf("Lethe v0.4 supports at most one tag filter")
+	}
+	projects := req.Projects
+	if len(projects) == 0 {
+		projects = []string{""}
+	}
+	eventTypes := req.EventTypes
+	if len(eventTypes) == 0 {
+		eventTypes = []string{""}
+	}
+
+	// Lethe v0.4 accepts one projectId and one eventType per request. Fan out
+	// explicit allowlists, then merge deterministically. A bare empty-query
+	// search is rejected upstream, so wildcard recent reads fan out over the
+	// four public event types.
+	if req.Query == "" && len(req.Projects) == 0 && len(req.EventTypes) == 0 {
+		eventTypes = []string{"record", "log", "flag", "task"}
+	}
+
+	merged := make(map[string]Event)
+	for _, project := range projects {
+		for _, eventType := range eventTypes {
+			result, err := c.searchEventsOnce(ctx, req, project, eventType)
+			if err != nil {
+				return nil, err
+			}
+			for _, event := range result.Events {
+				merged[event.ID] = event
+			}
+		}
+	}
+
+	events := make([]Event, 0, len(merged))
+	for _, event := range merged {
+		events = append(events, event)
+	}
+	sort.Slice(events, func(i, j int) bool {
+		if events[i].CreatedAt == events[j].CreatedAt {
+			return events[i].ID > events[j].ID
+		}
+		return events[i].CreatedAt > events[j].CreatedAt
+	})
+	if req.Limit > 0 && len(events) > req.Limit {
+		events = events[:req.Limit]
+	}
+
+	return &SearchResult{Events: events, Total: len(events)}, nil
+}
+
+func (c *Client) searchEventsOnce(ctx context.Context, req SearchRequest, project, eventType string) (*SearchResult, error) {
 	params := url.Values{}
 	params.Set("q", req.Query)
 	if req.Limit > 0 {
 		params.Set("limit", fmt.Sprintf("%d", req.Limit))
 	}
-	for _, et := range req.EventTypes {
-		params.Add("eventType", et)
+	if eventType != "" {
+		params.Set("eventType", eventType)
 	}
-	for _, p := range req.Projects {
-		params.Add("projectId", p)
+	if project != "" {
+		params.Set("projectId", project)
 	}
-	for _, t := range req.Tags {
-		params.Add("tag", t)
+	if len(req.Tags) > 0 {
+		params.Set("tag", req.Tags[0])
 	}
 	url := "/api/events/search?" + params.Encode()
 
@@ -142,7 +198,7 @@ func (c *Client) SearchEvents(ctx context.Context, req SearchRequest) (*SearchRe
 
 // GetEvent retrieves a single event by ID.
 func (c *Client) GetEvent(ctx context.Context, id string) (*Event, error) {
-	path := fmt.Sprintf("/api/events/%s", id)
+	path := fmt.Sprintf("/api/events/%s/chain", url.PathEscape(id))
 	resp, err := c.doRequest(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return nil, err
@@ -156,30 +212,35 @@ func (c *Client) GetEvent(ctx context.Context, id string) (*Event, error) {
 		return nil, fmt.Errorf("lethe returned %d", resp.StatusCode)
 	}
 
-	var event Event
-	if err := c.decodeJSON(resp, &event); err != nil {
+	var result struct {
+		Chain []Event `json:"chain"`
+	}
+	if err := c.decodeJSON(resp, &result); err != nil {
 		return nil, fmt.Errorf("decode event: %w", err)
 	}
-	return &event, nil
+	if len(result.Chain) == 0 {
+		return nil, fmt.Errorf("event not found: %s", id)
+	}
+	for i := range result.Chain {
+		if result.Chain[i].ID == id {
+			return &result.Chain[i], nil
+		}
+	}
+	return nil, fmt.Errorf("event not found in returned chain: %s", id)
 }
 
-// RecentEvents retrieves recent events.
+// RecentEvents retrieves recent events by using search with empty query.
 func (c *Client) RecentEvents(ctx context.Context, req RecentRequest) (*RecentResult, error) {
-	resp, err := c.doRequest(ctx, http.MethodPost, "/api/events/recent", req)
+	// Lethe v0.4 doesn't have /api/events/recent; use search with empty query
+	searchReq := SearchRequest{
+		Projects: req.Projects,
+		Limit:    req.Limit,
+	}
+	result, err := c.SearchEvents(ctx, searchReq)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("lethe returned %d", resp.StatusCode)
-	}
-
-	var result RecentResult
-	if err := c.decodeJSON(resp, &result); err != nil {
-		return nil, fmt.Errorf("decode recent: %w", err)
-	}
-	return &result, nil
+	return &RecentResult{Events: result.Events}, nil
 }
 
 // GetStats retrieves Lethe statistics.
@@ -201,22 +262,124 @@ func (c *Client) GetStats(ctx context.Context) (*StatsResult, error) {
 	return &stats, nil
 }
 
-func (c *Client) postSearch(ctx context.Context, path string, reqBody interface{}) (*SearchResult, error) {
-	resp, err := c.doRequest(ctx, http.MethodPost, path, reqBody)
+// Health verifies that the configured canonical Lethe API is reachable and
+// accepts Charon's private upstream credential.
+func (c *Client) Health(ctx context.Context) error {
+	resp, err := c.doRequest(ctx, http.MethodGet, "/api/health", nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("lethe returned %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// Thread represents a Lethe v0.4 thread.
+type Thread struct {
+	ID         string  `json:"thread_id"`
+	SessionID  string  `json:"session_id"`
+	Name       string  `json:"name"`
+	Title      string  `json:"title"`
+	Status     string  `json:"status"`
+	CreatedAt  string  `json:"created_at"`
+	UpdatedAt  string  `json:"updated_at"`
+	ResolvedAt *string `json:"resolved_at,omitempty"`
+}
+
+// Session contains the fields Charon needs to authorize thread reads.
+type Session struct {
+	ID        string `json:"session_id"`
+	ProjectID string `json:"project_id"`
+}
+
+func (c *Client) GetSession(ctx context.Context, id string) (*Session, error) {
+	resp, err := c.doRequest(ctx, http.MethodGet, "/api/sessions/"+url.PathEscape(id), nil)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("session not found: %s", id)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("lethe returned %d", resp.StatusCode)
 	}
-
-	var result SearchResult
-	if err := c.decodeJSON(resp, &result); err != nil {
-		return nil, fmt.Errorf("decode search: %w", err)
+	var session Session
+	if err := c.decodeJSON(resp, &session); err != nil {
+		return nil, fmt.Errorf("decode session: %w", err)
 	}
-	return &result, nil
+	return &session, nil
+}
+
+func (c *Client) ListThreads(ctx context.Context, sessionID, status string) ([]Thread, error) {
+	params := url.Values{}
+	if status != "" {
+		params.Set("status", status)
+	}
+	path := "/api/sessions/" + url.PathEscape(sessionID) + "/threads"
+	if encoded := params.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	resp, err := c.doRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("lethe returned %d", resp.StatusCode)
+	}
+	var result struct {
+		Threads []Thread `json:"threads"`
+	}
+	if err := c.decodeJSON(resp, &result); err != nil {
+		return nil, fmt.Errorf("decode threads: %w", err)
+	}
+	return result.Threads, nil
+}
+
+func (c *Client) GetThread(ctx context.Context, id string) (*Thread, error) {
+	resp, err := c.doRequest(ctx, http.MethodGet, "/api/threads/"+url.PathEscape(id), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("thread not found: %s", id)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("lethe returned %d", resp.StatusCode)
+	}
+	var result struct {
+		Thread Thread `json:"thread"`
+	}
+	if err := c.decodeJSON(resp, &result); err != nil {
+		return nil, fmt.Errorf("decode thread: %w", err)
+	}
+	return &result.Thread, nil
+}
+
+func (c *Client) GetThreadEvents(ctx context.Context, id string) (*Thread, []Event, error) {
+	resp, err := c.doRequest(ctx, http.MethodGet, "/api/threads/"+url.PathEscape(id)+"/events", nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil, fmt.Errorf("thread not found: %s", id)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, nil, fmt.Errorf("lethe returned %d", resp.StatusCode)
+	}
+	var result struct {
+		Thread Thread  `json:"thread"`
+		Events []Event `json:"events"`
+	}
+	if err := c.decodeJSON(resp, &result); err != nil {
+		return nil, nil, fmt.Errorf("decode thread events: %w", err)
+	}
+	return &result.Thread, result.Events, nil
 }
 
 func (c *Client) doRequest(ctx context.Context, method, path string, body interface{}) (*http.Response, error) {

@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -18,6 +19,25 @@ import (
 	"github.com/openlethe/charon/internal/proposal"
 	"github.com/openlethe/charon/internal/upstream/lethe"
 )
+
+type threadUnavailableError struct {
+	cause error
+}
+
+func (e *threadUnavailableError) Error() string { return "thread unavailable" }
+func (e *threadUnavailableError) Unwrap() error { return e.cause }
+
+func hideThreadAccessError(cause error) error {
+	return &threadUnavailableError{cause: cause}
+}
+
+func threadAccessCause(err error) error {
+	var hidden *threadUnavailableError
+	if errors.As(err, &hidden) {
+		return hidden.cause
+	}
+	return err
+}
 
 // Server wraps the MCP server with Charon policy.
 type Server struct {
@@ -63,7 +83,7 @@ func (s *Server) registerTools() {
 		mcp.WithString("query", mcp.Description("Search query string")),
 		mcp.WithArray("projects", mcp.Description("Projects to search (defaults to all authorized)"), mcp.WithStringItems()),
 		mcp.WithArray("event_types", mcp.Description("Filter by event types"), mcp.WithStringItems()),
-		mcp.WithArray("tags", mcp.Description("Filter by tags"), mcp.WithStringItems()),
+		mcp.WithArray("tags", mcp.Description("Filter by tag (Lethe v0.4 supports at most one)"), mcp.WithStringItems()),
 		mcp.WithNumber("limit", mcp.Description("Maximum results to return (default 20, max 100)"), mcp.Max(100)),
 		mcp.WithReadOnlyHintAnnotation(true),
 	)
@@ -78,6 +98,25 @@ func (s *Server) registerTools() {
 		mcp.WithDescription("Retrieve recent accepted memory"),
 		mcp.WithArray("projects", mcp.Description("Projects to include (defaults to all authorized)"), mcp.WithStringItems()),
 		mcp.WithNumber("limit", mcp.Description("Maximum results (default 20, max 100)"), mcp.Max(100)),
+		mcp.WithReadOnlyHintAnnotation(true),
+	)
+
+	threadListTool := mcp.NewTool("thread_list",
+		mcp.WithDescription("List memory threads for an authorized Lethe session"),
+		mcp.WithString("session_id", mcp.Required(), mcp.Description("Lethe session ID or session key")),
+		mcp.WithString("status", mcp.Description("Optional thread status"), mcp.Enum("open", "resolved", "blocked")),
+		mcp.WithReadOnlyHintAnnotation(true),
+	)
+
+	threadGetTool := mcp.NewTool("thread_get",
+		mcp.WithDescription("Retrieve one memory thread from an authorized project"),
+		mcp.WithString("id", mcp.Required(), mcp.Description("Thread ID")),
+		mcp.WithReadOnlyHintAnnotation(true),
+	)
+
+	threadEventsTool := mcp.NewTool("thread_events",
+		mcp.WithDescription("Retrieve the events in a memory thread from an authorized project"),
+		mcp.WithString("id", mcp.Required(), mcp.Description("Thread ID")),
 		mcp.WithReadOnlyHintAnnotation(true),
 	)
 
@@ -126,6 +165,9 @@ func (s *Server) registerTools() {
 	s.mcpServer.AddTool(searchTool, s.handleSearch)
 	s.mcpServer.AddTool(getTool, s.handleGet)
 	s.mcpServer.AddTool(recentTool, s.handleRecent)
+	s.mcpServer.AddTool(threadListTool, s.handleThreadList)
+	s.mcpServer.AddTool(threadGetTool, s.handleThreadGet)
+	s.mcpServer.AddTool(threadEventsTool, s.handleThreadEvents)
 	s.mcpServer.AddTool(proposeTool, s.handlePropose)
 	s.mcpServer.AddTool(checkpointTool, s.handleCheckpoint)
 	s.mcpServer.AddTool(listProposalsTool, s.handleListProposals)
@@ -202,10 +244,10 @@ func (s *Server) handlePropose(ctx context.Context, request mcp.CallToolRequest)
 
 	// Build provenance
 	prov := proposal.Provenance{
-		Principal: principal.ID,
-		Session:   reqID,
+		Principal:     principal.ID,
+		Session:       reqID,
 		CaptureMethod: "memory_propose",
-		AuthorType: "model",
+		AuthorType:    "model",
 	}
 
 	var tags []string
@@ -574,7 +616,7 @@ func (s *Server) handleSearch(ctx context.Context, request mcp.CallToolRequest) 
 
 	filtered := make([]lethe.Event, 0, len(result.Events))
 	for _, ev := range result.Events {
-		if principal.HasProject(ev.Project) {
+		if principal.HasReadProject(ev.Project) {
 			filtered = append(filtered, ev)
 		}
 	}
@@ -612,7 +654,7 @@ func (s *Server) handleGet(ctx context.Context, request mcp.CallToolRequest) (*m
 		return nil, fmt.Errorf("get failed: %w", err)
 	}
 
-	if !principal.HasProject(event.Project) {
+	if !principal.HasReadProject(event.Project) {
 		s.recordLedger(reqID, principal, "memory_get", []string{event.Project}, "denied: cross-project", time.Since(start))
 		return nil, fmt.Errorf("unauthorized: event not in authorized project")
 	}
@@ -673,7 +715,7 @@ func (s *Server) handleRecent(ctx context.Context, request mcp.CallToolRequest) 
 
 	filtered := make([]lethe.Event, 0, len(result.Events))
 	for _, ev := range result.Events {
-		if principal.HasProject(ev.Project) {
+		if principal.HasReadProject(ev.Project) {
 			filtered = append(filtered, ev)
 		}
 	}
@@ -685,6 +727,110 @@ func (s *Server) handleRecent(ctx context.Context, request mcp.CallToolRequest) 
 
 	data, _ := json.MarshalIndent(resp, "", "  ")
 	s.recordLedger(reqID, principal, "memory_recent", projects, "success", time.Since(start))
+	return mcp.NewToolResultText(string(data)), nil
+}
+
+func (s *Server) handleThreadList(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	start := time.Now()
+	principal := authFromContext(ctx)
+	reqID := requestIDFromContext(ctx)
+	if err := policy.RequireScope(principal, "thread.read"); err != nil {
+		s.recordLedger(reqID, principal, "thread_list", nil, "denied: missing scope", time.Since(start))
+		return nil, fmt.Errorf("unauthorized: %w", err)
+	}
+
+	args := request.GetArguments()
+	sessionID := getString(args, "session_id")
+	if sessionID == "" {
+		return nil, fmt.Errorf("missing required argument: session_id")
+	}
+	session, err := s.lethe.GetSession(ctx, sessionID)
+	if err != nil {
+		s.recordLedger(reqID, principal, "thread_list", nil, "error: "+sanitizeError(err), time.Since(start))
+		return nil, hideThreadAccessError(err)
+	}
+	if err := policy.RequireReadProject(principal, session.ProjectID); err != nil {
+		s.recordLedger(reqID, principal, "thread_list", []string{session.ProjectID}, "denied: project access", time.Since(start))
+		return nil, hideThreadAccessError(err)
+	}
+
+	threads, err := s.lethe.ListThreads(ctx, sessionID, getString(args, "status"))
+	if err != nil {
+		s.recordLedger(reqID, principal, "thread_list", []string{session.ProjectID}, "error: "+sanitizeError(err), time.Since(start))
+		return nil, fmt.Errorf("list threads failed: %w", err)
+	}
+	data, _ := json.MarshalIndent(map[string]interface{}{"threads": threads, "count": len(threads)}, "", "  ")
+	s.recordLedger(reqID, principal, "thread_list", []string{session.ProjectID}, "success", time.Since(start))
+	return mcp.NewToolResultText(string(data)), nil
+}
+
+func (s *Server) authorizeThread(ctx context.Context, principal auth.Principal, threadID string) (*lethe.Thread, string, error) {
+	thread, err := s.lethe.GetThread(ctx, threadID)
+	if err != nil {
+		return nil, "", hideThreadAccessError(err)
+	}
+	session, err := s.lethe.GetSession(ctx, thread.SessionID)
+	if err != nil {
+		return nil, "", hideThreadAccessError(err)
+	}
+	if err := policy.RequireReadProject(principal, session.ProjectID); err != nil {
+		return nil, session.ProjectID, hideThreadAccessError(err)
+	}
+	return thread, session.ProjectID, nil
+}
+
+func (s *Server) handleThreadGet(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	start := time.Now()
+	principal := authFromContext(ctx)
+	reqID := requestIDFromContext(ctx)
+	if err := policy.RequireScope(principal, "thread.read"); err != nil {
+		s.recordLedger(reqID, principal, "thread_get", nil, "denied: missing scope", time.Since(start))
+		return nil, fmt.Errorf("unauthorized: %w", err)
+	}
+	threadID := getString(request.GetArguments(), "id")
+	if threadID == "" {
+		return nil, fmt.Errorf("missing required argument: id")
+	}
+	thread, projectID, err := s.authorizeThread(ctx, principal, threadID)
+	if err != nil {
+		s.recordLedger(reqID, principal, "thread_get", []string{projectID}, "denied or failed: "+sanitizeError(threadAccessCause(err)), time.Since(start))
+		return nil, fmt.Errorf("thread access failed: %w", err)
+	}
+	data, _ := json.MarshalIndent(thread, "", "  ")
+	s.recordLedger(reqID, principal, "thread_get", []string{projectID}, "success", time.Since(start))
+	return mcp.NewToolResultText(string(data)), nil
+}
+
+func (s *Server) handleThreadEvents(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	start := time.Now()
+	principal := authFromContext(ctx)
+	reqID := requestIDFromContext(ctx)
+	if err := policy.RequireScope(principal, "thread.read"); err != nil {
+		s.recordLedger(reqID, principal, "thread_events", nil, "denied: missing scope", time.Since(start))
+		return nil, fmt.Errorf("unauthorized: %w", err)
+	}
+	threadID := getString(request.GetArguments(), "id")
+	if threadID == "" {
+		return nil, fmt.Errorf("missing required argument: id")
+	}
+	_, projectID, err := s.authorizeThread(ctx, principal, threadID)
+	if err != nil {
+		s.recordLedger(reqID, principal, "thread_events", []string{projectID}, "denied or failed: "+sanitizeError(threadAccessCause(err)), time.Since(start))
+		return nil, fmt.Errorf("thread access failed: %w", err)
+	}
+	thread, events, err := s.lethe.GetThreadEvents(ctx, threadID)
+	if err != nil {
+		s.recordLedger(reqID, principal, "thread_events", []string{projectID}, "error: "+sanitizeError(err), time.Since(start))
+		return nil, fmt.Errorf("get thread events failed: %w", err)
+	}
+	filtered := make([]lethe.Event, 0, len(events))
+	for _, event := range events {
+		if principal.HasReadProject(event.Project) {
+			filtered = append(filtered, event)
+		}
+	}
+	data, _ := json.MarshalIndent(map[string]interface{}{"thread": thread, "events": filtered, "count": len(filtered)}, "", "  ")
+	s.recordLedger(reqID, principal, "thread_events", []string{projectID}, "success", time.Since(start))
 	return mcp.NewToolResultText(string(data)), nil
 }
 

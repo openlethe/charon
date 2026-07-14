@@ -49,65 +49,40 @@ fi
 if [ -z "$LETHE_API_KEY" ]; then
     echo "ERROR: LETHE_API_KEY is required."
     echo ""
-    echo "Generate one with: docker run --rm lethe:local-v0.4 keygen"
+    echo "Generate one with: openssl rand -hex 32"
     echo "Then add it to your .env file:"
-    echo "  LETHE_API_KEY=lethe_xxx..."
+    echo "  LETHE_API_KEY=your-generated-key"
     echo ""
     exit 1
 fi
 
-# Check if we should auto-bootstrap
+# Reconcile the configured principal on every start. The marker is used only
+# to avoid printing/minting a fresh legacy Obol after every restart.
+TOKEN_MARKER="${DATA_DIR}/.bootstrap-token-minted"
+BOOTSTRAP_PRINCIPAL_FILE="${DATA_DIR}/.bootstrap-principal"
+
 if [ -n "$CHARON_AUTO_USER" ]; then
-    # Use a marker file to prevent re-bootstrapping on restart
-    BOOTSTRAP_MARKER="${DATA_DIR}/.bootstrapped"
-    
-    if [ ! -f "$BOOTSTRAP_MARKER" ]; then
-        echo ""
-        echo "╔══════════════════════════════════════════════════════════════╗"
-        echo "║  Charon Auto-Bootstrap                                       ║"
-        echo "╚══════════════════════════════════════════════════════════════╝"
-        echo ""
-        echo "Creating principal: $CHARON_AUTO_USER"
-        
-        # Create principal
-        PRINCIPAL_OUTPUT=$($CHARON_BIN principal create "$CHARON_AUTO_USER" 2>&1)
-        PRINCIPAL_ID=$(echo "$PRINCIPAL_OUTPUT" | awk '{print $3}')
-        echo "  Principal ID: $PRINCIPAL_ID"
-        
-        # Grant project
-        PROJECT="${CHARON_AUTO_PROJECT:-default}"
-        $CHARON_BIN principal grant-project "$PRINCIPAL_ID" "$PROJECT" > /dev/null 2>&1
-        echo "  Project: $PROJECT"
-        
-        # Grant scopes based on permission level
-        PERMISSION="${CHARON_AUTO_PERMISSION:-propose}"
-        echo "  Permission: $PERMISSION"
-        
-        case "$PERMISSION" in
-            readonly)
-                $CHARON_BIN principal grant-scope "$PRINCIPAL_ID" memory.search > /dev/null 2>&1
-                $CHARON_BIN principal grant-scope "$PRINCIPAL_ID" memory.read > /dev/null 2>&1
-                ;;
-            propose)
-                $CHARON_BIN principal grant-scope "$PRINCIPAL_ID" memory.search > /dev/null 2>&1
-                $CHARON_BIN principal grant-scope "$PRINCIPAL_ID" memory.read > /dev/null 2>&1
-                $CHARON_BIN principal grant-scope "$PRINCIPAL_ID" memory.propose > /dev/null 2>&1
-                ;;
-            write)
-                $CHARON_BIN principal grant-scope "$PRINCIPAL_ID" memory.search > /dev/null 2>&1
-                $CHARON_BIN principal grant-scope "$PRINCIPAL_ID" memory.read > /dev/null 2>&1
-                $CHARON_BIN principal grant-scope "$PRINCIPAL_ID" memory.propose > /dev/null 2>&1
-                $CHARON_BIN principal grant-scope "$PRINCIPAL_ID" memory.write > /dev/null 2>&1
-                ;;
-            *)
-                echo "WARNING: Unknown permission '$PERMISSION', defaulting to propose"
-                $CHARON_BIN principal grant-scope "$PRINCIPAL_ID" memory.search > /dev/null 2>&1
-                $CHARON_BIN principal grant-scope "$PRINCIPAL_ID" memory.read > /dev/null 2>&1
-                $CHARON_BIN principal grant-scope "$PRINCIPAL_ID" memory.propose > /dev/null 2>&1
-                ;;
-        esac
-        
-        # Mint token
+    echo ""
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    echo "║  Charon Principal Reconciliation                            ║"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo ""
+
+    PROJECTS="${CHARON_AUTO_PROJECTS:-${CHARON_AUTO_PROJECT:-default}}"
+    PERMISSION="${CHARON_AUTO_PERMISSION:-readonly}"
+    PRINCIPAL_OUTPUT=$($CHARON_BIN principal reconcile "$CHARON_AUTO_USER" "$PERMISSION" "$PROJECTS" 2>&1)
+    PRINCIPAL_ID=$(echo "$PRINCIPAL_OUTPUT" | awk '/^Reconciled principal:/ {print $3}')
+    if [ -z "$PRINCIPAL_ID" ]; then
+        echo "ERROR: principal reconciliation did not return an ID"
+        echo "$PRINCIPAL_OUTPUT"
+        exit 1
+    fi
+    echo "  Principal ID: $PRINCIPAL_ID"
+    echo "  Projects:     $PROJECTS"
+    echo "  Permission:   $PERMISSION"
+    echo "$PRINCIPAL_ID" > "$BOOTSTRAP_PRINCIPAL_FILE"
+
+    if [ ! -f "$TOKEN_MARKER" ] && [ "${CHARON_AUTH_MODE:-obol}" != "oauth" ]; then
         EXPIRES="${CHARON_AUTO_EXPIRES:-7d}"
         echo ""
         echo "═══════════════════════════════════════════════════════════════"
@@ -120,8 +95,21 @@ if [ -n "$CHARON_AUTO_USER" ]; then
         echo "This message will not appear again."
         echo ""
         
-        # Create marker file to prevent re-bootstrap
-        touch "$BOOTSTRAP_MARKER"
+        touch "$TOKEN_MARKER"
+    fi
+
+    if [ -z "$CHARON_OAUTH_DEFAULT_USER" ]; then
+        export CHARON_OAUTH_DEFAULT_USER="$PRINCIPAL_ID"
+        echo "Set CHARON_OAUTH_DEFAULT_USER=$PRINCIPAL_ID"
+    fi
+fi
+
+# If OAuth default user is still not set, try to load from bootstrap file
+if [ -z "$CHARON_OAUTH_DEFAULT_USER" ] && [ -f "$BOOTSTRAP_PRINCIPAL_FILE" ]; then
+    BOOTSTRAP_PRINCIPAL=$(cat "$BOOTSTRAP_PRINCIPAL_FILE" | tr -d '[:space:]')
+    if [ -n "$BOOTSTRAP_PRINCIPAL" ]; then
+        export CHARON_OAUTH_DEFAULT_USER="$BOOTSTRAP_PRINCIPAL"
+        echo "Restored CHARON_OAUTH_DEFAULT_USER=$BOOTSTRAP_PRINCIPAL from bootstrap"
     fi
 fi
 
@@ -137,7 +125,7 @@ if [ "${CHARON_AUTH_MODE:-obol}" = "oauth" ] && [ -n "$CHARON_PUBLIC_URL" ]; the
     echo "  Authorize:  ${CHARON_PUBLIC_URL}/oauth/authorize"
     echo "  Token:      ${CHARON_PUBLIC_URL}/oauth/token"
     echo ""
-    echo "  (Any client ID works — Charon auto-registers unknown clients)"
+    echo "  Redirects: ${CHARON_OAUTH_REDIRECT_URIS:-not configured}"
     echo ""
 fi
 

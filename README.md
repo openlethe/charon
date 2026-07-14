@@ -28,6 +28,9 @@ Lethe (Memory Store)
 - `memory_search` — Search accepted memory across authorized projects
 - `memory_get` — Retrieve a single memory event by ID
 - `memory_recent` — Retrieve recent accepted memory
+- `thread_list` — List threads for an authorized session
+- `thread_get` — Retrieve a thread from an authorized project
+- `thread_events` — Retrieve authorized events in a thread
 
 ### Proposals (Phase 5)
 - `memory_propose` — Propose a durable memory entry for approval
@@ -65,6 +68,10 @@ make build
 ./bin/charon principal grant-project principal_... charon
 ./bin/charon principal grant-scope principal_... memory.search
 ./bin/charon principal grant-scope principal_... memory.read
+./bin/charon principal grant-scope principal_... thread.read
+
+# Or reconcile exact grants idempotently (used by the container entrypoint)
+./bin/charon principal reconcile "My Client" readonly '*'
 ```
 
 ### 4. Mint an Obol
@@ -92,6 +99,7 @@ curl -H "Authorization: Bearer obol_..._..." \
 | `charon principal create <name>` | Create a new principal |
 | `charon principal grant-project <id> <project>` | Grant project access |
 | `charon principal grant-scope <id> <scope>` | Grant scope |
+| `charon principal reconcile <name> <permission> <projects>` | Create/update exact grants |
 | `charon obol mint <principal-id>` | Mint a new obol |
 | `charon obol ls <principal-id>` | List obols |
 | `charon obol revoke <obol-id>` | Revoke an obol |
@@ -102,9 +110,21 @@ curl -H "Authorization: Bearer obol_..._..." \
 
 ## Docker
 
+Charon connects to one existing canonical Lethe API; it never mounts or writes
+a copied Lethe SQLite database. For Docker Desktop, the default upstream is
+`http://host.docker.internal:18483`.
+
 ```bash
-docker-compose up -d
+CHARON_AUTO_USER=chatgpt \
+CHARON_AUTO_PERMISSION=readonly \
+CHARON_AUTO_PROJECTS='*' \
+CHARON_OAUTH_REDIRECT_URIS='https://chatgpt.com/connector/oauth/*,https://chatgpt.com/connector_platform_oauth_redirect' \
+docker compose up -d
 ```
+
+OAuth authorization is restricted to `CHARON_OAUTH_CLIENT_ID` and the explicit
+redirect allowlist. A trailing `*` permits ChatGPT's per-app callback ID path;
+do not use broad host wildcards.
 
 ## Development
 

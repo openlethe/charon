@@ -4,7 +4,7 @@ package auth
 type Principal struct {
 	ID       string
 	Name     string
-	AgentID  string            // Maps to Lethe's agent_id for event attribution
+	AgentID  string // Maps to Lethe's agent_id for event attribution
 	Projects map[string]struct{}
 	Scopes   map[string]struct{}
 	Audience string
@@ -19,6 +19,18 @@ func (p Principal) HasScope(scope string) bool {
 // HasProject checks if the principal has a given project grant.
 func (p Principal) HasProject(projectID string) bool {
 	_, ok := p.Projects[projectID]
+	return ok
+}
+
+// HasReadProject checks read authorization, where the wildcard grant is valid.
+// Mutation paths must use HasProject so * can never expand write access.
+func (p Principal) HasReadProject(projectID string) bool {
+	return p.HasAllProjects() || p.HasProject(projectID)
+}
+
+// HasAllProjects reports whether the principal has the read-policy wildcard.
+func (p Principal) HasAllProjects() bool {
+	_, ok := p.Projects["*"]
 	return ok
 }
 
