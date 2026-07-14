@@ -172,6 +172,9 @@ func (s *Server) registerTools() {
 	s.mcpServer.AddTool(checkpointTool, s.handleCheckpoint)
 	s.mcpServer.AddTool(listProposalsTool, s.handleListProposals)
 	s.mcpServer.AddTool(writeTool, s.handleWrite)
+
+	// Memory Git V1 tools
+	s.registerMemoryGitTools()
 }
 
 // checkIdempotency handles the idempotency check with race-condition protection.

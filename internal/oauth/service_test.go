@@ -116,6 +116,38 @@ func TestRedirectURIMatch(t *testing.T) {
 	}
 }
 
+func TestAutoApprovedAuthCodeStripsMutationScopes(t *testing.T) {
+	s, err := NewService([]byte("test-key-32-bytes-long-for-hs256"), "https://example.com", "chatgpt-mcp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SetScopeLookup(func(string) ([]string, error) {
+		return []string{"memory.read", "memory.branch", "memory.commit", "memory.propose"}, nil
+	})
+	code, err := s.GenerateAuthCode("chatgpt-mcp", "user", "https://example.com/callback", "verifier", "plain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := s.ExchangeAuthCode(code, "chatgpt-mcp", "https://example.com/callback", "verifier")
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims, err := s.ValidateAccessToken(resp.AccessToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, scope := range claims.Scopes {
+		got[scope] = true
+	}
+	if got["memory.branch"] || got["memory.commit"] {
+		t.Fatalf("auto-approved token retained mutation scopes: %#v", claims.Scopes)
+	}
+	if !got["memory.read"] || !got["memory.propose"] {
+		t.Fatalf("safe scopes missing: %#v", claims.Scopes)
+	}
+}
+
 // TestConfidentialClientCredentials verifies that confidential clients can
 // use the client_credentials grant.
 func TestConfidentialClientCredentials(t *testing.T) {

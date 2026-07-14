@@ -163,7 +163,10 @@ func (s *Service) AuthorizationServerMetadata() map[string]interface{} {
 		"response_types_supported":              []string{"code"},
 		"grant_types_supported":                 []string{"authorization_code", "client_credentials"},
 		"code_challenge_methods_supported":      []string{"S256"},
-		"scopes_supported":                      []string{"memory.read", "memory.search", "thread.read", "memory.propose", "memory.write", "proposal.review"},
+		"scopes_supported": []string{
+			"memory.read", "memory.search", "thread.read", "memory.branch", "memory.commit",
+			"memory.propose", "memory.review", "memory.merge", "memory.write", "proposal.review",
+		},
 	}
 	if s.clientID != "" {
 		meta["client_id"] = s.clientID
@@ -176,7 +179,10 @@ func (s *Service) ProtectedResourceMetadata() map[string]interface{} {
 	meta := map[string]interface{}{
 		"resource":              s.issuer + "/mcp",
 		"authorization_servers": []string{s.issuer},
-		"scopes_supported":      []string{"memory.read", "memory.search", "thread.read", "memory.propose", "memory.write", "proposal.review"},
+		"scopes_supported": []string{
+			"memory.read", "memory.search", "thread.read", "memory.branch", "memory.commit",
+			"memory.propose", "memory.review", "memory.merge", "memory.write", "proposal.review",
+		},
 	}
 	if s.clientID != "" {
 		meta["client_id"] = s.clientID
@@ -292,7 +298,9 @@ func (s *Service) ExchangeAuthCode(code, clientID, redirectURI, codeVerifier str
 			s.mu.Unlock()
 			return nil, fmt.Errorf("scope lookup failed: %w", lookupErr)
 		}
-		// Cap to safe subset — never write/review via auto-approve
+		// Cap to non-mutating scopes. This authorization endpoint auto-approves
+		// public clients, so branch/commit still require a separately trusted
+		// credential even though their refs are actor-scoped.
 		safeOnly := make([]string, 0, len(scopes))
 		for _, sc := range scopes {
 			switch sc {

@@ -19,6 +19,10 @@ func TestCreateAndGet(t *testing.T) {
 	// Migration v2 creates proposals table
 	svc := NewService(db, nil)
 	ctx := context.Background()
+	missing, err := svc.FindByIdempotency(ctx, "p1", "missing")
+	if err != nil || missing != nil {
+		t.Fatalf("idempotency miss = %#v, %v", missing, err)
+	}
 
 	req := CreateRequest{
 		ProjectID:      "charon",
@@ -174,5 +178,85 @@ func TestList(t *testing.T) {
 	}
 	if len(proposals) != 3 {
 		t.Errorf("expected 3 proposals, got %d", len(proposals))
+	}
+}
+
+func TestMemoryGitMergeRequestUsesExistingProposalLifecycle(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+	svc := NewService(db, nil)
+	ctx := context.Background()
+
+	p, err := svc.Create(ctx, CreateRequest{
+		ProjectID: "lethe", EventType: "merge_request", Kind: "merge_request",
+		Content: "review memory branch", Provenance: Provenance{Principal: "author"},
+		IdempotencyKey: "merge-1", RequestID: "req-merge-1",
+		BaseChangesetID: "base-1", HeadChangesetID: "head-1", TargetRef: "refs/shared/main",
+		SelectedOps: []int{0, 2}, ConflictIDs: []string{"conflict-1"},
+	})
+	if err != nil {
+		t.Fatalf("create merge request: %v", err)
+	}
+	got, err := svc.Get(ctx, p.ID)
+	if err != nil {
+		t.Fatalf("get merge request: %v", err)
+	}
+	if got.BaseChangesetID != "base-1" || got.HeadChangesetID != "head-1" || got.TargetRef != "refs/shared/main" {
+		t.Fatalf("merge fields not preserved: %#v", got)
+	}
+	if len(got.SelectedOps) != 2 || len(got.ConflictIDs) != 1 {
+		t.Fatalf("merge collections not preserved: %#v", got)
+	}
+	got, err = svc.SetMergeResult(ctx, p.ID, "merge-result-1")
+	if err != nil || got.ChangesetID != "merge-result-1" {
+		t.Fatalf("persist merge result = %#v, %v", got, err)
+	}
+	if _, err := svc.SetMergeResult(ctx, p.ID, "different-result"); err == nil {
+		t.Fatal("merge result was allowed to change")
+	}
+
+	got, err = svc.AddReviewFinding(ctx, p.ID, ReviewFinding{Reviewer: "reviewer", Comment: "scope checked"})
+	if err != nil || len(got.ReviewFindings) != 1 || got.ReviewFindings[0].Reviewer != "reviewer" {
+		t.Fatalf("review finding = %#v, %v", got, err)
+	}
+	if _, err := svc.CompleteMerge(ctx, p.ID, "author", "merge-result-1"); err == nil {
+		t.Fatal("originator was allowed to approve its own merge")
+	}
+	approved, err := svc.CompleteMerge(ctx, p.ID, "reviewer", "merge-result-1")
+	if err != nil {
+		t.Fatalf("complete merge: %v", err)
+	}
+	if approved.Status != StatusApproved || approved.ResultingLetheEventID != "merge-result-1" {
+		t.Fatalf("approved merge = %#v", approved)
+	}
+}
+
+func TestMergeCancellationPreservesProposal(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+	svc := NewService(db, nil)
+	p, err := svc.Create(context.Background(), CreateRequest{
+		ProjectID: "lethe", EventType: "merge_request", Kind: "merge_request",
+		Provenance: Provenance{Principal: "author"}, IdempotencyKey: "cancel-1",
+		HeadChangesetID: "head", TargetRef: "refs/shared/main",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Cancel(context.Background(), p.ID, "intruder"); err == nil {
+		t.Fatal("non-originator cancelled proposal")
+	}
+	cancelled, err := svc.Cancel(context.Background(), p.ID, "author")
+	if err != nil || cancelled.Status != StatusCancelled {
+		t.Fatalf("cancel = %#v, %v", cancelled, err)
+	}
+	if _, err := svc.Get(context.Background(), p.ID); err != nil {
+		t.Fatalf("cancelled proposal history was not preserved: %v", err)
 	}
 }

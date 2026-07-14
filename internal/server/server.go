@@ -41,6 +41,7 @@ func NewServer(cfg *config.Config, db *store.DB, logger *slog.Logger) (*Server, 
 	obolSvc := obol.NewService(db, cfg.HMACKey)
 	ledgerSvc := ledger.NewService(db)
 	letheClient := lethe.NewClient(cfg.Upstream, cfg.LetheAPIKey, cfg.RequestTimeout, int64(cfg.MaxResultBytes))
+	letheClient.SetMergeSigningKey(cfg.HMACKey)
 	proposalSvc := proposal.NewService(db, letheClient)
 	idempotencySvc := idempotency.NewService(db)
 	mcpServer := mcp.NewServer(cfg, letheClient, ledgerSvc, proposalSvc, idempotencySvc)

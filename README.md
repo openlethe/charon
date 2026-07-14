@@ -40,6 +40,15 @@ Lethe (Memory Store)
 ### Direct Writes (Phase 6)
 - `memory_write` — Direct trusted write to Lethe (requires `memory.write` scope)
 
+### Memory Git V1
+- `memory_status`, `memory_log`, `memory_show`, `memory_diff`, `memory_ref_list` — Inspect authorized project history
+- `memory_branch_create` — Create an owned agent, session, or topic ref
+- `memory_changeset_create` — CAS commit to an owned non-protected ref
+- `memory_merge_propose` — Reuse Charon proposals as merge requests into protected refs
+- `memory_merge_review` — Attach attributed review findings
+- `memory_merge` — Apply reviewed fast-forward, multi-parent, or selected-op merges
+- `memory_merge_cancel` — Cancel a pending merge request without deleting its branch history
+
 ## CLI Commands
 
 ```bash
@@ -140,8 +149,9 @@ make docker  # Build container
 - **Fail-closed**: Missing secrets prevent startup
 - **Least-privilege**: Scoped projects and scopes per principal
 - **No generic proxy**: Strict Lethe adapter with typed methods only
-- **Quarantine**: All model writes go through proposal approval (Phase 5)
+- **Quarantine**: Canonical/protected memory changes go through proposal review; branch work remains isolated
 - **Audit**: Hash-chained ledger entries for every operation
+- **Protected refs**: Charon-signed merge CAS; generic Lethe writes cannot move protected refs
 - **Obols**: High-entropy bearer credentials with HMAC verification
 - **Local admin**: Admin interface binds to loopback only
 

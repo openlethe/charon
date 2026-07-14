@@ -98,8 +98,8 @@ func TestOAuthMCPReturnsV04LetheMemory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MCP list tools: %v", err)
 	}
-	if len(tools.Tools) != 10 {
-		t.Fatalf("tool count = %d, want 10", len(tools.Tools))
+	if len(tools.Tools) != 21 {
+		t.Fatalf("tool count = %d, want 21", len(tools.Tools))
 	}
 
 	request := mcp.CallToolRequest{}

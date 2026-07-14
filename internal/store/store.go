@@ -95,6 +95,18 @@ func (db *DB) migrate() error {
 		}
 	}
 
+	if currentVersion < 4 {
+		if err := db.migrateV4(); err != nil {
+			return err
+		}
+		if _, err := db.ExecContext(ctx,
+			"INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+			4, time.Now().UTC().Format(time.RFC3339),
+		); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -234,5 +246,36 @@ func (db *DB) migrateV3() error {
 		}
 	}
 
+	return tx.Commit()
+}
+
+// migrateV4 extends the existing proposal table so Charon proposals can also
+// represent Memory Git merge requests. It deliberately does not introduce a
+// second proposal store or lifecycle.
+func (db *DB) migrateV4() error {
+	ctx := context.Background()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	statements := []string{
+		`ALTER TABLE proposals ADD COLUMN changeset_id TEXT`,
+		`ALTER TABLE proposals ADD COLUMN base_changeset_id TEXT`,
+		`ALTER TABLE proposals ADD COLUMN head_changeset_id TEXT`,
+		`ALTER TABLE proposals ADD COLUMN target_ref TEXT`,
+		`ALTER TABLE proposals ADD COLUMN selected_ops_json TEXT NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE proposals ADD COLUMN conflict_ids_json TEXT NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE proposals ADD COLUMN review_findings_json TEXT NOT NULL DEFAULT '[]'`,
+		`CREATE INDEX idx_proposals_changeset ON proposals(changeset_id)`,
+		`CREATE INDEX idx_proposals_base ON proposals(base_changeset_id)`,
+		`CREATE INDEX idx_proposals_target_ref ON proposals(target_ref)`,
+	}
+	for _, stmt := range statements {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("migration v4: %w", err)
+		}
+	}
 	return tx.Commit()
 }
