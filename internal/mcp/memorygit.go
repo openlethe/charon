@@ -753,15 +753,19 @@ func (s *Server) handleMemoryMerge(ctx context.Context, request mcp.CallToolRequ
 			return nil, fmt.Errorf("persisted merge result is unavailable or crossed project boundary")
 		}
 		if target.HeadChangesetID != resultID {
+			strategy := lethe.StrategyCherryPick
 			if resultID == p.HeadChangesetID {
 				ancestor, err := s.isChangesetAncestor(ctx, target.HeadChangesetID, resultID, p.ProjectID)
 				if err != nil || !ancestor {
 					return nil, fmt.Errorf("persisted fast-forward result is stale against current target")
 				}
+				strategy = lethe.StrategyFastForward
 			} else if len(result.ParentIDs) == 0 || result.ParentIDs[0] != target.HeadChangesetID {
 				return nil, fmt.Errorf("persisted merge result is stale against current target")
+			} else if len(result.ParentIDs) == 2 {
+				strategy = lethe.StrategyMergeCommit
 			}
-			if err := s.advanceProtectedMerge(ctx, p, target.HeadChangesetID, resultID, reviewer); err != nil {
+			if err := s.advanceProtectedMerge(ctx, p, target.HeadChangesetID, resultID, reviewer, principal.ID, strategy); err != nil {
 				return nil, fmt.Errorf("recover protected merge: %w", err)
 			}
 		}
@@ -794,7 +798,7 @@ func (s *Server) handleMemoryMerge(ctx context.Context, request mcp.CallToolRequ
 		if err != nil {
 			return nil, err
 		}
-		if err := s.advanceProtectedMerge(ctx, p, target.HeadChangesetID, resultID, reviewer); err != nil {
+		if err := s.advanceProtectedMerge(ctx, p, target.HeadChangesetID, resultID, reviewer, principal.ID, lethe.StrategyCherryPick); err != nil {
 			return nil, fmt.Errorf("cherry-pick merge failed: %w", err)
 		}
 	} else {
@@ -810,10 +814,7 @@ func (s *Server) handleMemoryMerge(ctx context.Context, request mcp.CallToolRequ
 			if err != nil {
 				return nil, err
 			}
-			if _, err := s.lethe.MergeAdvanceRef(ctx, p.ProjectID, p.TargetRef, lethe.MergeAdvanceRequest{
-				ExpectedHead: target.HeadChangesetID, NewHead: p.HeadChangesetID,
-				MergeProposalID: p.ID, ReviewerPrincipal: reviewer,
-			}); err != nil {
+			if err := s.advanceProtectedMerge(ctx, p, target.HeadChangesetID, p.HeadChangesetID, reviewer, principal.ID, lethe.StrategyFastForward); err != nil {
 				return nil, fmt.Errorf("fast-forward merge failed: %w", err)
 			}
 			resultID = p.HeadChangesetID
@@ -868,7 +869,7 @@ func (s *Server) handleMemoryMerge(ctx context.Context, request mcp.CallToolRequ
 			if err != nil {
 				return nil, err
 			}
-			if err := s.advanceProtectedMerge(ctx, p, target.HeadChangesetID, resultID, reviewer); err != nil {
+			if err := s.advanceProtectedMerge(ctx, p, target.HeadChangesetID, resultID, reviewer, principal.ID, lethe.StrategyMergeCommit); err != nil {
 				return nil, fmt.Errorf("reviewed merge failed: %w", err)
 			}
 		}
@@ -910,13 +911,17 @@ func (s *Server) handleMemoryMerge(ctx context.Context, request mcp.CallToolRequ
 	return mcp.NewToolResultText(string(data)), nil
 }
 
-func (s *Server) advanceProtectedMerge(ctx context.Context, p *proposal.Proposal, expectedHead, newHead, reviewer string) error {
+// advanceProtectedMerge signs a fresh single-use authorization bound to the
+// current proposal-state digest and drives Lethe's enforced merge path. The
+// strategy declares the merge shape Lethe must independently verify.
+func (s *Server) advanceProtectedMerge(ctx context.Context, p *proposal.Proposal, expectedHead, newHead, reviewer, merger, strategy string) error {
 	if expectedHead == newHead {
 		return nil
 	}
 	_, err := s.lethe.MergeAdvanceRef(ctx, p.ProjectID, p.TargetRef, lethe.MergeAdvanceRequest{
 		ExpectedHead: expectedHead, NewHead: newHead,
 		MergeProposalID: p.ID, ReviewerPrincipal: reviewer,
+		ProposalDigest: p.StateDigest, MergerPrincipal: merger, Strategy: strategy,
 	})
 	return err
 }

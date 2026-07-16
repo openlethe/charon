@@ -45,6 +45,8 @@ func NewServer(cfg *config.Config, db *store.DB, logger *slog.Logger) (*Server, 
 	ledgerSvc := ledger.NewService(db)
 	letheClient := lethe.NewClient(cfg.Upstream, cfg.LetheAPIKey, cfg.RequestTimeout, int64(cfg.MaxResultBytes))
 	letheClient.SetMergeSigningKey(cfg.MergeKey())
+	letheClient.SetMergeSigningKeyID(cfg.MergeHMACKeyID)
+	letheClient.SetMergeAuthorizationTTL(cfg.MergeAuthorizationTTL)
 	proposalSvc := proposal.NewService(db, letheClient)
 	migrated, quarantined, err := proposalSvc.MigrateStateDigests(context.Background())
 	if err != nil {

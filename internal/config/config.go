@@ -91,6 +91,15 @@ type Config struct {
 	// upstream. Lethe receives this value as its CHARON_HMAC_KEY.
 	MergeHMACKey string `env:"CHARON_MERGE_HMAC_KEY"`
 
+	// MergeHMACKeyID names which configured Lethe key signs merge envelopes.
+	// Rotation keeps both IDs configured at Lethe during the overlap window.
+	MergeHMACKeyID string `env:"CHARON_MERGE_HMAC_KEY_ID"`
+
+	// MergeAuthorizationTTL bounds how long a signed merge authorization
+	// lives. Short by design; values outside (0, 15m] are rejected so an
+	// authorization can never be long-lived.
+	MergeAuthorizationTTL time.Duration `env:"CHARON_MERGE_AUTH_TTL" envDefault:"2m"`
+
 	// MaxResultBytes caps MCP tool response sizes.
 	MaxResultBytes int `env:"CHARON_MAX_RESULT_BYTES" envDefault:"1048576"`
 
@@ -144,6 +153,10 @@ func FromEnv() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	mergeAuthTTL, err := getEnvDuration("CHARON_MERGE_AUTH_TTL", 2*time.Minute, time.Second, 15*time.Minute)
+	if err != nil {
+		return nil, err
+	}
 	readHeaderTimeout, err := getEnvDuration("CHARON_HTTP_READ_HEADER_TIMEOUT", 10*time.Second, time.Second, time.Minute)
 	if err != nil {
 		return nil, err
@@ -183,6 +196,8 @@ func FromEnv() (*Config, error) {
 		ObolHMACKey:                firstNonEmpty(os.Getenv("CHARON_OBOL_HMAC_KEY"), os.Getenv("CHARON_HMAC_KEY")),
 		OAuthHMACKey:               firstNonEmpty(os.Getenv("CHARON_OAUTH_HMAC_KEY"), os.Getenv("CHARON_HMAC_KEY")),
 		MergeHMACKey:               firstNonEmpty(os.Getenv("CHARON_MERGE_HMAC_KEY"), os.Getenv("CHARON_HMAC_KEY")),
+		MergeHMACKeyID:             os.Getenv("CHARON_MERGE_HMAC_KEY_ID"),
+		MergeAuthorizationTTL:      mergeAuthTTL,
 		MaxResultBytes:             maxResultBytes,
 		MaxResultCount:             maxResultCount,
 		MaxRequestBytes:            int64(maxRequestBytes),

@@ -99,7 +99,13 @@ type MergeAdvanceRequest struct {
 	NewHead           string `json:"new_head"`
 	MergeProposalID   string `json:"merge_proposal_id"`
 	ReviewerPrincipal string `json:"reviewer_principal"`
-	Authorization     string `json:"merge_authorization"`
+	// ProposalDigest binds the authorization to the exact reviewed proposal
+	// state. MergerPrincipal is the principal executing the merge. Strategy
+	// is the merge shape Lethe independently enforces.
+	ProposalDigest  string `json:"-"`
+	MergerPrincipal string `json:"-"`
+	Strategy        string `json:"-"`
+	Authorization   string `json:"merge_authorization"`
 }
 
 type DetectConflictsRequest struct {
@@ -349,10 +355,13 @@ func (c *Client) CASAdvanceRef(ctx context.Context, projectID, refName string, r
 	return &ref, nil
 }
 
-// MergeAdvanceRef advances a protected ref through Lethe's explicit merge path.
+// MergeAdvanceRef advances a protected ref through Lethe's explicit merge
+// path. Every call signs a fresh expiring, single-use authorization envelope
+// bound to the exact merge fields and the proposal-state digest.
 func (c *Client) MergeAdvanceRef(ctx context.Context, projectID, refName string, req MergeAdvanceRequest) (*Ref, error) {
 	req.RefName = refName
-	signature, err := c.signMergeAuthorization(projectID, refName, req.ExpectedHead, req.NewHead, req.MergeProposalID, req.ReviewerPrincipal)
+	signature, err := c.signMergeAuthorizationV2(projectID, refName, req.ExpectedHead, req.NewHead,
+		req.MergeProposalID, req.ProposalDigest, req.ReviewerPrincipal, req.MergerPrincipal, req.Strategy)
 	if err != nil {
 		return nil, err
 	}

@@ -51,6 +51,8 @@ func TestMemoryGitRefPathsPreserveSlashNames(t *testing.T) {
 	}
 	merged, err := client.MergeAdvanceRef(context.Background(), "project", "refs/shared/main", MergeAdvanceRequest{
 		ExpectedHead: "new", NewHead: "merged", MergeProposalID: "proposal-1", ReviewerPrincipal: "reviewer",
+		ProposalDigest:  "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		MergerPrincipal: "merger", Strategy: StrategyFastForward,
 	})
 	if err != nil || merged.HeadChangesetID != "merged" {
 		t.Fatalf("MergeAdvanceRef = %#v, %v", merged, err)

@@ -3,8 +3,6 @@ package lethe
 import (
 	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,6 +17,8 @@ type Client struct {
 	baseURL         string
 	apiKey          string
 	mergeSigningKey []byte
+	mergeKeyID      string
+	mergeAuthTTL    time.Duration
 	httpClient      *http.Client
 	maxBody         int64
 }
@@ -27,16 +27,6 @@ type Client struct {
 // It is intentionally distinct from the Lethe bearer API token.
 func (c *Client) SetMergeSigningKey(key string) {
 	c.mergeSigningKey = []byte(key)
-}
-
-func (c *Client) signMergeAuthorization(project, refName, expectedHead, newHead, proposalID, reviewer string) (string, error) {
-	if len(c.mergeSigningKey) < 32 {
-		return "", fmt.Errorf("merge signing key is not configured")
-	}
-	message := fmt.Sprintf("memory-git-merge/v1\n%s\n%s\n%s\n%s\n%s\n%s", project, refName, expectedHead, newHead, proposalID, reviewer)
-	mac := hmac.New(sha256.New, c.mergeSigningKey)
-	_, _ = mac.Write([]byte(message))
-	return fmt.Sprintf("%x", mac.Sum(nil)), nil
 }
 
 // NewClient creates a Lethe client.
