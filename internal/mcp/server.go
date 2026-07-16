@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -77,7 +78,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) registerTools() {
-	// Read-only tools
+	if s.cfg != nil && s.cfg.Mode == config.ModeMemoryGit {
+		// Charon's frontier-model path is versioned by construction. Do not
+		// register compatibility tools that read or write legacy Lethe events.
+		s.registerMemoryGitTools()
+		return
+	}
+
+	// Compatibility/read-only tools
 	searchTool := mcp.NewTool("memory_search",
 		mcp.WithDescription("Search accepted memory across authorized projects"),
 		mcp.WithString("query", mcp.Description("Search query string")),
@@ -180,7 +188,7 @@ func (s *Server) registerTools() {
 // checkIdempotency handles the idempotency check with race-condition protection.
 // If the key exists with matching input, returns the existing record.
 // If the key exists with different input, returns an error.
-func (s *Server) checkIdempotency(ctx context.Context, principalID, operation, key string, args map[string]interface{}) (*idempotency.Record, error) {
+func (s *Server) checkIdempotency(ctx context.Context, principalID, operation, key string, args any) (*idempotency.Record, error) {
 	check, err := s.idempotency.Check(ctx, principalID, operation, key, args)
 	if err != nil {
 		return nil, fmt.Errorf("idempotency check failed: %w", err)
@@ -196,7 +204,7 @@ func (s *Server) checkIdempotency(ctx context.Context, principalID, operation, k
 
 // storeIdempotency stores the idempotency record, handling concurrent races.
 // If another request already stored the key, it re-checks and returns the existing record.
-func (s *Server) storeIdempotency(ctx context.Context, principalID, operation, key string, args map[string]interface{}, status, resourceID string) (*idempotency.Record, error) {
+func (s *Server) storeIdempotency(ctx context.Context, principalID, operation, key string, args any, status, resourceID string) (*idempotency.Record, error) {
 	err := s.idempotency.Store(ctx, principalID, operation, key, args, status, resourceID, "")
 	if err == nil {
 		return nil, nil // stored successfully
@@ -841,14 +849,21 @@ func (s *Server) recordLedger(reqID string, principal auth.Principal, operation 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	_ = s.ledger.Record(ctx, ledger.Entry{
+	if err := s.ledger.Record(ctx, ledger.Entry{
 		RequestID:   reqID,
 		PrincipalID: principal.ID,
 		Operation:   operation,
 		Projects:    projects,
 		Result:      result,
 		Latency:     latency,
-	})
+	}); err != nil {
+		slog.Error("audit ledger write failed",
+			"request_id", reqID,
+			"principal", principal.ID,
+			"operation", operation,
+			"error", sanitizeError(err),
+		)
+	}
 }
 
 // sanitizeError redacts potentially sensitive information from error strings

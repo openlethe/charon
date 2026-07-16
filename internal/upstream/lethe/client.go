@@ -132,7 +132,7 @@ type CreateEventRequest struct {
 // SearchEvents queries Lethe for events.
 func (c *Client) SearchEvents(ctx context.Context, req SearchRequest) (*SearchResult, error) {
 	if len(req.Tags) > 1 {
-		return nil, fmt.Errorf("Lethe v0.4 supports at most one tag filter")
+		return nil, fmt.Errorf("lethe v0.4 supports at most one tag filter")
 	}
 	projects := req.Projects
 	if len(projects) == 0 {
@@ -424,6 +424,19 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 }
 
 func (c *Client) decodeJSON(resp *http.Response, v interface{}) error {
-	reader := io.LimitReader(resp.Body, c.maxBody)
-	return json.NewDecoder(reader).Decode(v)
+	maxBody := c.maxBody
+	if maxBody <= 0 {
+		maxBody = 1 << 20
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
+	if err != nil {
+		return err
+	}
+	if int64(len(data)) > maxBody {
+		return fmt.Errorf("response body exceeds %d bytes", maxBody)
+	}
+	if err := json.Unmarshal(data, v); err != nil {
+		return err
+	}
+	return nil
 }

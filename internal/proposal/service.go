@@ -2,10 +2,15 @@ package proposal
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand/v2"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -24,12 +29,42 @@ const (
 	StatusExpired   Status = "expired"
 )
 
-// ReviewFinding is an immutable review comment attached to a proposal.
+// ReviewVerdict is an explicit merge-review decision.
+type ReviewVerdict string
+
+const (
+	ReviewVerdictApprove        ReviewVerdict = "approve"
+	ReviewVerdictRequestChanges ReviewVerdict = "request_changes"
+	ReviewVerdictReject         ReviewVerdict = "reject"
+)
+
+// Integrity errors. Every failure to decode, validate, or verify persisted
+// proposal state is a hard corruption error; nothing is normalized into an
+// empty or default value because defaults widen authorization (a corrupt
+// selected-ops list would otherwise become a full merge).
+var (
+	// ErrProposalCorrupt means a persisted proposal failed decode, validation,
+	// or state-digest verification. Loading fails closed.
+	ErrProposalCorrupt = errors.New("proposal persisted state is corrupt")
+	// ErrProposalQuarantined means a pre-v5 row whose persisted JSON did not
+	// decode during the digest backfill; it has no state digest and is never
+	// loaded into an authorization path again.
+	ErrProposalQuarantined = errors.New("proposal quarantined: no verifiable state digest")
+	// ErrIdempotencyMismatch means an idempotency key was replayed with a
+	// request whose canonical digest differs from the recorded one.
+	ErrIdempotencyMismatch = errors.New("idempotency key exists with a different request")
+)
+
+// ReviewFinding is an immutable review decision attached to the exact proposal
+// state that was inspected. Free-form comments never imply approval.
 type ReviewFinding struct {
-	Reviewer  string    `json:"reviewer"`
-	Comment   string    `json:"comment"`
-	Severity  string    `json:"severity,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
+	Reviewer              string        `json:"reviewer"`
+	Verdict               ReviewVerdict `json:"verdict"`
+	Comment               string        `json:"comment"`
+	Severity              string        `json:"severity,omitempty"`
+	TargetHeadChangesetID string        `json:"target_head_changeset_id"`
+	TargetDigest          string        `json:"target_digest"`
+	CreatedAt             time.Time     `json:"created_at"`
 }
 
 // Proposal represents the existing Charon proposal lifecycle. Memory Git
@@ -63,6 +98,13 @@ type Proposal struct {
 	SelectedOps     []int
 	ConflictIDs     []string
 	ReviewFindings  []ReviewFinding
+
+	// RequestDigest is the canonical digest of the exact request that created
+	// the proposal; replays are matched against it. StateDigest is the
+	// canonical integrity digest over the persisted proposal state, recomputed
+	// on every mutation and verified on every load.
+	RequestDigest string
+	StateDigest   string
 }
 
 // Provenance tracks who/what created the proposal.
@@ -84,6 +126,12 @@ type Service struct {
 // NewService creates a proposal service.
 func NewService(db *store.DB, letheClient *lethe.Client) *Service {
 	return &Service{db: db, lethe: letheClient}
+}
+
+// MigrateStateDigests runs the v5 state-digest backfill. It must succeed
+// before the service is used; see BackfillStateDigests.
+func (s *Service) MigrateStateDigests(ctx context.Context) (int, int, error) {
+	return BackfillStateDigests(ctx, s.db)
 }
 
 // CreateRequest is used to create a memory proposal or Memory Git merge request.
@@ -114,27 +162,30 @@ const proposalColumns = `
 	originating_session, request_id, idempotency_key, status, created_at,
 	decided_at, decided_by, resulting_lethe_event_id,
 	changeset_id, base_changeset_id, head_changeset_id, target_ref,
-	selected_ops_json, conflict_ids_json, review_findings_json`
+	selected_ops_json, conflict_ids_json, review_findings_json,
+	request_digest, state_digest`
 
-// Create inserts a new proposal into Charon's existing quarantine.
-func (s *Service) Create(ctx context.Context, req CreateRequest) (*Proposal, error) {
+func validateCreateRequest(req CreateRequest) error {
 	if req.ProjectID == "" {
-		return nil, errors.New("project_id required")
+		return errors.New("project_id required")
 	}
 	if req.Kind != "merge_request" && req.Content == "" {
-		return nil, errors.New("content required")
+		return errors.New("content required")
 	}
 	if req.Kind == "merge_request" && (req.HeadChangesetID == "" || req.TargetRef == "") {
-		return nil, errors.New("merge_request requires head_changeset_id and target_ref")
+		return errors.New("merge_request requires head_changeset_id and target_ref")
 	}
 	if req.Provenance.Principal == "" {
-		return nil, errors.New("originating principal required")
+		return errors.New("originating principal required")
 	}
 	if req.IdempotencyKey == "" {
-		return nil, errors.New("idempotency_key required")
+		return errors.New("idempotency_key required")
 	}
+	return nil
+}
 
-	p := &Proposal{
+func newProposalFromRequest(req CreateRequest) *Proposal {
+	return &Proposal{
 		ID:                   uuid.Must(uuid.NewV7()).String(),
 		ProjectID:            req.ProjectID,
 		ProposedEventType:    req.EventType,
@@ -159,24 +210,140 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (*Proposal, err
 		ConflictIDs:          nonNilStrings(req.ConflictIDs),
 		ReviewFindings:       []ReviewFinding{},
 	}
+}
 
+const insertProposalSQL = `
+	INSERT INTO proposals (` + proposalColumns + `)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+
+func insertProposal(ctx context.Context, ex interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}, p *Proposal) error {
 	tagsJSON, _ := json.Marshal(p.Tags)
 	selectedJSON, _ := json.Marshal(p.SelectedOps)
 	conflictsJSON, _ := json.Marshal(p.ConflictIDs)
 	findingsJSON, _ := json.Marshal(p.ReviewFindings)
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO proposals (`+proposalColumns+`)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?)
-	`, p.ID, p.ProjectID, p.ProposedEventType, p.Kind, p.Content, p.Reason,
+	_, err := ex.ExecContext(ctx, insertProposalSQL,
+		p.ID, p.ProjectID, p.ProposedEventType, p.Kind, p.Content, p.Reason,
 		p.Confidence, string(tagsJSON), p.OriginatingPrincipal, p.OriginatingClient,
 		p.OriginatingProvider, p.OriginatingSession, p.RequestID, p.IdempotencyKey,
 		string(p.Status), p.CreatedAt, nullString(p.ChangesetID), nullString(p.BaseChangesetID),
 		nullString(p.HeadChangesetID), nullString(p.TargetRef), string(selectedJSON),
-		string(conflictsJSON), string(findingsJSON))
+		string(conflictsJSON), string(findingsJSON), nullString(p.RequestDigest),
+		p.StateDigest)
+	return err
+}
+
+// Create inserts a new proposal into Charon's existing quarantine. Callers that
+// need exactly-once semantics (merge requests) must use CreateIdempotent.
+func (s *Service) Create(ctx context.Context, req CreateRequest) (*Proposal, error) {
+	if err := validateCreateRequest(req); err != nil {
+		return nil, err
+	}
+	p := newProposalFromRequest(req)
+	digest, err := StateDigest(p)
 	if err != nil {
+		return nil, fmt.Errorf("digest proposal state: %w", err)
+	}
+	p.StateDigest = digest
+	if err := insertProposal(ctx, s.db, p); err != nil {
 		return nil, fmt.Errorf("insert proposal: %w", err)
 	}
 	return p, nil
+}
+
+// CreateIdempotent creates a merge proposal exactly once. The proposal row,
+// its canonical request digest, and the generic idempotency record commit in
+// ONE transaction, so there is no window in which a crash leaves an ambiguous
+// proposal without an idempotency record. An exact replay returns the original
+// proposal with replay=true; a replay with the same key but a different
+// canonical request fails closed with ErrIdempotencyMismatch. Concurrent
+// identical requests converge on the single inserted row through the
+// (originating_principal, idempotency_key) uniqueness constraint.
+func (s *Service) CreateIdempotent(ctx context.Context, req CreateRequest, digestInput RequestDigestInput) (p *Proposal, replay bool, err error) {
+	if err := validateCreateRequest(req); err != nil {
+		return nil, false, err
+	}
+	requestDigest, err := RequestDigest(digestInput)
+	if err != nil {
+		return nil, false, fmt.Errorf("digest request: %w", err)
+	}
+	principal := req.Provenance.Principal
+
+	existing, err := s.FindByIdempotency(ctx, principal, req.IdempotencyKey)
+	if err != nil {
+		return nil, false, err
+	}
+	if existing != nil {
+		return matchReplay(existing, requestDigest, req.IdempotencyKey)
+	}
+
+	p = newProposalFromRequest(req)
+	p.RequestDigest = requestDigest
+	stateDigest, err := StateDigest(p)
+	if err != nil {
+		return nil, false, fmt.Errorf("digest proposal state: %w", err)
+	}
+	p.StateDigest = stateDigest
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, false, fmt.Errorf("begin proposal idempotency transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	if err := insertProposal(ctx, tx, p); err != nil {
+		if !isUniqueViolation(err) {
+			return nil, false, fmt.Errorf("insert proposal: %w", err)
+		}
+		// Lost a concurrent race: the winner's row is authoritative.
+		existing, findErr := s.FindByIdempotency(ctx, principal, req.IdempotencyKey)
+		if findErr != nil {
+			return nil, false, findErr
+		}
+		if existing == nil {
+			return nil, false, fmt.Errorf("proposal insert conflicted but no row is visible for key %s", req.IdempotencyKey)
+		}
+		return matchReplay(existing, requestDigest, req.IdempotencyKey)
+	}
+
+	// Generic idempotency record committed in the same transaction: both
+	// sources of truth move atomically. The hash stores the raw canonical
+	// request digest so reconciliation can join records to proposals.
+	rawDigest, _ := hex.DecodeString(requestDigest)
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO idempotency_records (
+			principal_id, operation, idempotency_key, request_hash,
+			status, resulting_resource_id, stored_response, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, principal, "memory_merge_propose", req.IdempotencyKey, rawDigest,
+		"pending", p.ID, "", time.Now().UTC().Format(time.RFC3339)); err != nil {
+		if !isUniqueViolation(err) {
+			return nil, false, fmt.Errorf("insert idempotency record: %w", err)
+		}
+		existing, findErr := s.FindByIdempotency(ctx, principal, req.IdempotencyKey)
+		if findErr != nil {
+			return nil, false, findErr
+		}
+		if existing == nil {
+			return nil, false, fmt.Errorf("idempotency record conflicted but no proposal is visible for key %s", req.IdempotencyKey)
+		}
+		return matchReplay(existing, requestDigest, req.IdempotencyKey)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, false, fmt.Errorf("commit proposal idempotency transaction: %w", err)
+	}
+	return p, false, nil
+}
+
+// matchReplay classifies an idempotency-key hit: the stored proposal is
+// returned only when its recorded request digest equals the replay's digest.
+func matchReplay(existing *Proposal, requestDigest, key string) (*Proposal, bool, error) {
+	if existing.RequestDigest == "" || existing.RequestDigest != requestDigest {
+		return nil, false, fmt.Errorf("%w: key %s", ErrIdempotencyMismatch, key)
+	}
+	return existing, true, nil
 }
 
 // FindByIdempotency looks up an existing proposal by idempotency key.
@@ -231,8 +398,10 @@ type ApproveRequest struct {
 	DecidedBy  string
 }
 
-// Approve retains the existing memory-proposal behavior. Memory Git merge
-// requests are applied through CompleteMerge after the protected ref CAS.
+// Approve fails closed for legacy event proposals. Lethe's legacy create-event
+// API does not expose an idempotency key or caller-supplied event ID, so Charon
+// cannot make approval crash-safe without risking duplicate durable events.
+// Memory Git merge requests use CompleteMerge after the protected ref CAS.
 func (s *Service) Approve(ctx context.Context, req ApproveRequest) (*Proposal, error) {
 	p, err := s.Get(ctx, req.ProposalID)
 	if err != nil {
@@ -244,9 +413,7 @@ func (s *Service) Approve(ctx context.Context, req ApproveRequest) (*Proposal, e
 	if p.Status != StatusPending {
 		return p, fmt.Errorf("proposal already %s", p.Status)
 	}
-	// Preserve the existing v0 behavior until canonical event materialization is
-	// moved behind the same idempotent service boundary.
-	return s.complete(ctx, p, StatusApproved, req.DecidedBy, "placeholder-event-id")
+	return p, errors.New("legacy proposal approval is unavailable because Lethe event creation is not idempotent; use the Memory Git merge workflow")
 }
 
 // CompleteMerge marks a merge request approved after Lethe has atomically
@@ -276,14 +443,24 @@ func (s *Service) CompleteMerge(ctx context.Context, proposalID, decidedBy, resu
 
 func (s *Service) complete(ctx context.Context, p *Proposal, status Status, decidedBy, resultID string) (*Proposal, error) {
 	now := time.Now().UTC()
+	next := *p
+	next.Status = status
+	next.DecidedAt = &now
+	next.DecidedBy = decidedBy
+	next.ResultingLetheEventID = resultID
+	nextDigest, err := StateDigest(&next)
+	if err != nil {
+		return nil, fmt.Errorf("digest proposal state: %w", err)
+	}
 	res, err := s.db.ExecContext(ctx, `UPDATE proposals
-		SET status = ?, decided_at = ?, decided_by = ?, resulting_lethe_event_id = ?
-		WHERE id = ? AND status = ?`, string(status), now, decidedBy, resultID, p.ID, string(StatusPending))
+		SET status = ?, decided_at = ?, decided_by = ?, resulting_lethe_event_id = ?, state_digest = ?
+		WHERE id = ? AND status = ? AND state_digest = ?`,
+		string(status), now, decidedBy, resultID, nextDigest, p.ID, string(StatusPending), p.StateDigest)
 	if err != nil {
 		return nil, fmt.Errorf("complete proposal: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
-		return nil, fmt.Errorf("proposal not found or already decided: %s", p.ID)
+		return nil, fmt.Errorf("proposal not found, already decided, or state changed concurrently: %s", p.ID)
 	}
 	return s.Get(ctx, p.ID)
 }
@@ -320,57 +497,174 @@ func (s *Service) transition(ctx context.Context, id string, status Status, deci
 	if id == "" {
 		return nil, errors.New("proposal_id required")
 	}
+	p, err := s.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
 	now := time.Now().UTC()
-	res, err := s.db.ExecContext(ctx, `UPDATE proposals SET status = ?, decided_at = ?, decided_by = ?
-		WHERE id = ? AND status = ?`, string(status), now, decidedBy, id, string(StatusPending))
+	next := *p
+	next.Status = status
+	next.DecidedAt = &now
+	next.DecidedBy = decidedBy
+	nextDigest, err := StateDigest(&next)
+	if err != nil {
+		return nil, fmt.Errorf("digest proposal state: %w", err)
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE proposals SET status = ?, decided_at = ?, decided_by = ?, state_digest = ?
+		WHERE id = ? AND status = ? AND state_digest = ?`,
+		string(status), now, decidedBy, nextDigest, id, string(StatusPending), p.StateDigest)
 	if err != nil {
 		return nil, fmt.Errorf("transition proposal: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
-		return nil, fmt.Errorf("proposal not found or already decided: %s", id)
+		return nil, fmt.Errorf("proposal not found, already decided, or state changed concurrently: %s", id)
 	}
 	return s.Get(ctx, id)
 }
 
-// AddReviewFinding appends an attributed finding to a pending proposal.
+// ReviewTargetDigest binds a review decision to the exact immutable merge
+// request fields the reviewer inspected. The same fields are covered by the
+// proposal state digest, so approval and merge stay bound to one canonical
+// proposal state.
+func ReviewTargetDigest(p *Proposal, targetHeadChangesetID string) string {
+	if p == nil {
+		return ""
+	}
+	payload, _ := json.Marshal(struct {
+		ProposalID            string `json:"proposal_id"`
+		ProjectID             string `json:"project_id"`
+		BaseChangesetID       string `json:"base_changeset_id"`
+		HeadChangesetID       string `json:"head_changeset_id"`
+		TargetRef             string `json:"target_ref"`
+		SelectedOps           []int  `json:"selected_ops"`
+		TargetHeadChangesetID string `json:"target_head_changeset_id"`
+	}{
+		ProposalID:            p.ID,
+		ProjectID:             p.ProjectID,
+		BaseChangesetID:       p.BaseChangesetID,
+		HeadChangesetID:       p.HeadChangesetID,
+		TargetRef:             p.TargetRef,
+		SelectedOps:           nonNilInts(p.SelectedOps),
+		TargetHeadChangesetID: targetHeadChangesetID,
+	})
+	digest := sha256.Sum256(payload)
+	return hex.EncodeToString(digest[:])
+}
+
+func validReviewVerdict(verdict ReviewVerdict) bool {
+	switch verdict {
+	case ReviewVerdictApprove, ReviewVerdictRequestChanges, ReviewVerdictReject:
+		return true
+	default:
+		return false
+	}
+}
+
+// maxStateRaceRetries bounds optimistic-concurrency retries when concurrent
+// reviewers or merge-time updates mutate the same proposal. Dozens of
+// concurrent reviewers are legitimate, so the bound sits well above expected
+// contention; each retry observes the winner's write before re-applying.
+const maxStateRaceRetries = 64
+
+// stateRaceBackoff sleeps briefly before the next optimistic-concurrency
+// round so contending writers do not retry in lockstep.
+func stateRaceBackoff(attempt int) {
+	backoff := time.Duration(1<<min(attempt, 6)) * time.Millisecond
+	// #nosec G404 -- jitter does not require cryptographic randomness.
+	jitter := time.Duration(rand.Int64N(int64(backoff) + 1))
+	time.Sleep(backoff/2 + jitter)
+}
+
+// AddReviewFinding atomically appends an attributed decision to a pending
+// merge proposal. The append is read-modify-write guarded by the state digest:
+// exactly one concurrent writer wins each round, losers reload (observing the
+// winner's finding) and retry, so findings are never silently dropped and the
+// persisted state digest always covers the persisted findings.
 func (s *Service) AddReviewFinding(ctx context.Context, proposalID string, finding ReviewFinding) (*Proposal, error) {
-	p, err := s.Get(ctx, proposalID)
-	if err != nil {
-		return nil, err
-	}
-	if p.Status != StatusPending {
-		return nil, fmt.Errorf("proposal already %s", p.Status)
-	}
 	if finding.Reviewer == "" || finding.Comment == "" {
 		return nil, errors.New("reviewer and comment required")
 	}
-	if finding.CreatedAt.IsZero() {
-		finding.CreatedAt = time.Now().UTC()
+	if !validReviewVerdict(finding.Verdict) {
+		return nil, errors.New("verdict must be approve, request_changes, or reject")
 	}
-	p.ReviewFindings = append(p.ReviewFindings, finding)
-	b, _ := json.Marshal(p.ReviewFindings)
-	if _, err := s.db.ExecContext(ctx, `UPDATE proposals SET review_findings_json = ? WHERE id = ? AND status = ?`,
-		string(b), proposalID, string(StatusPending)); err != nil {
-		return nil, fmt.Errorf("attach review finding: %w", err)
+	if finding.TargetHeadChangesetID == "" {
+		return nil, errors.New("target_head_changeset_id required")
 	}
-	return s.Get(ctx, proposalID)
+
+	for attempt := 0; ; attempt++ {
+		p, err := s.Get(ctx, proposalID)
+		if err != nil {
+			return nil, err
+		}
+		if p.Kind != "merge_request" {
+			return nil, errors.New("proposal is not a merge request")
+		}
+		if p.Status != StatusPending {
+			return nil, fmt.Errorf("proposal already %s", p.Status)
+		}
+		finding.TargetDigest = ReviewTargetDigest(p, finding.TargetHeadChangesetID)
+		if finding.CreatedAt.IsZero() {
+			finding.CreatedAt = time.Now().UTC()
+		}
+		next := *p
+		next.ReviewFindings = append(append([]ReviewFinding{}, p.ReviewFindings...), finding)
+		nextDigest, err := StateDigest(&next)
+		if err != nil {
+			return nil, fmt.Errorf("digest proposal state: %w", err)
+		}
+		findingsJSON, err := json.Marshal(next.ReviewFindings)
+		if err != nil {
+			return nil, fmt.Errorf("marshal review findings: %w", err)
+		}
+		res, err := s.db.ExecContext(ctx, `
+			UPDATE proposals
+			SET review_findings_json = ?, state_digest = ?
+			WHERE id = ? AND status = ? AND state_digest = ?
+		`, string(findingsJSON), nextDigest, proposalID, string(StatusPending), p.StateDigest)
+		if err != nil {
+			return nil, fmt.Errorf("attach review finding: %w", err)
+		}
+		if n, _ := res.RowsAffected(); n == 1 {
+			return s.Get(ctx, proposalID)
+		}
+		if attempt+1 >= maxStateRaceRetries {
+			return nil, fmt.Errorf("proposal %s changed concurrently; review finding could not be attached", proposalID)
+		}
+		stateRaceBackoff(attempt)
+	}
 }
 
 // SetConflictIDs replaces the conflict snapshot after a merge-time recheck.
 func (s *Service) SetConflictIDs(ctx context.Context, proposalID string, ids []string) (*Proposal, error) {
-	p, err := s.Get(ctx, proposalID)
-	if err != nil {
-		return nil, err
+	for attempt := 0; ; attempt++ {
+		p, err := s.Get(ctx, proposalID)
+		if err != nil {
+			return nil, err
+		}
+		if p.Status != StatusPending {
+			return nil, fmt.Errorf("proposal already %s", p.Status)
+		}
+		next := *p
+		next.ConflictIDs = nonNilStrings(ids)
+		nextDigest, err := StateDigest(&next)
+		if err != nil {
+			return nil, fmt.Errorf("digest proposal state: %w", err)
+		}
+		b, _ := json.Marshal(next.ConflictIDs)
+		res, err := s.db.ExecContext(ctx, `UPDATE proposals SET conflict_ids_json = ?, state_digest = ?
+			WHERE id = ? AND status = ? AND state_digest = ?`,
+			string(b), nextDigest, proposalID, string(StatusPending), p.StateDigest)
+		if err != nil {
+			return nil, fmt.Errorf("update conflict ids: %w", err)
+		}
+		if n, _ := res.RowsAffected(); n == 1 {
+			return s.Get(ctx, proposalID)
+		}
+		if attempt+1 >= maxStateRaceRetries {
+			return nil, fmt.Errorf("proposal %s changed concurrently; conflict snapshot could not be updated", proposalID)
+		}
+		stateRaceBackoff(attempt)
 	}
-	if p.Status != StatusPending {
-		return nil, fmt.Errorf("proposal already %s", p.Status)
-	}
-	b, _ := json.Marshal(nonNilStrings(ids))
-	if _, err := s.db.ExecContext(ctx, `UPDATE proposals SET conflict_ids_json = ? WHERE id = ? AND status = ?`,
-		string(b), proposalID, string(StatusPending)); err != nil {
-		return nil, fmt.Errorf("update conflict ids: %w", err)
-	}
-	return s.Get(ctx, proposalID)
 }
 
 // SetMergeResult persists the exact changeset that a pending merge will move
@@ -380,16 +674,37 @@ func (s *Service) SetMergeResult(ctx context.Context, proposalID, changesetID st
 	if changesetID == "" {
 		return nil, errors.New("changeset_id required")
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE proposals SET changeset_id = ?
-		WHERE id = ? AND status = ? AND (changeset_id IS NULL OR changeset_id = '' OR changeset_id = ?)`,
-		changesetID, proposalID, string(StatusPending), changesetID)
-	if err != nil {
-		return nil, fmt.Errorf("persist merge result: %w", err)
+	for attempt := 0; ; attempt++ {
+		p, err := s.Get(ctx, proposalID)
+		if err != nil {
+			return nil, err
+		}
+		if p.Status != StatusPending {
+			return nil, fmt.Errorf("proposal merge result cannot change after decision: %s", proposalID)
+		}
+		if p.ChangesetID != "" && p.ChangesetID != changesetID {
+			return nil, fmt.Errorf("proposal merge result already differs: %s", proposalID)
+		}
+		next := *p
+		next.ChangesetID = changesetID
+		nextDigest, err := StateDigest(&next)
+		if err != nil {
+			return nil, fmt.Errorf("digest proposal state: %w", err)
+		}
+		res, err := s.db.ExecContext(ctx, `UPDATE proposals SET changeset_id = ?, state_digest = ?
+			WHERE id = ? AND status = ? AND state_digest = ?`,
+			changesetID, nextDigest, proposalID, string(StatusPending), p.StateDigest)
+		if err != nil {
+			return nil, fmt.Errorf("persist merge result: %w", err)
+		}
+		if n, _ := res.RowsAffected(); n == 1 {
+			return s.Get(ctx, proposalID)
+		}
+		if attempt+1 >= maxStateRaceRetries {
+			return nil, fmt.Errorf("proposal %s changed concurrently; merge result could not be persisted", proposalID)
+		}
+		stateRaceBackoff(attempt)
 	}
-	if n, _ := res.RowsAffected(); n != 1 {
-		return nil, fmt.Errorf("proposal merge result already differs or proposal is not pending: %s", proposalID)
-	}
-	return s.Get(ctx, proposalID)
 }
 
 // Get retrieves a single proposal by ID.
@@ -408,24 +723,71 @@ type rowScanner interface {
 	Scan(dest ...any) error
 }
 
+// hexDigestPattern matches a SHA-256 hex digest.
+var hexDigestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// scanProposal decodes one proposal row and fails closed on any irregularity:
+// undecodable JSON, invalid values, unparseable timestamps, a missing state
+// digest (quarantined legacy row), or a state-digest mismatch (tampering or
+// corruption). Nothing is normalized into empty defaults.
 func scanProposal(row rowScanner) (*Proposal, error) {
+	p, stateDigest, err := scanProposalRaw(row)
+	if err != nil {
+		return nil, err
+	}
+	corrupt := func(format string, args ...any) error {
+		return fmt.Errorf("%w: proposal %s: %s", ErrProposalCorrupt, p.ID, fmt.Sprintf(format, args...))
+	}
+	// Integrity verification last: a row without a verifiable digest is
+	// quarantined; a row whose digest does not match its decoded state was
+	// tampered with or corrupted after write.
+	if stateDigest == "" {
+		return nil, fmt.Errorf("%w: proposal %s", ErrProposalQuarantined, p.ID)
+	}
+	expected, err := StateDigest(p)
+	if err != nil {
+		return nil, corrupt("state digest cannot be recomputed: %v", err)
+	}
+	if expected != stateDigest {
+		return nil, corrupt("state digest mismatch (stored %s, computed %s)", stateDigest, expected)
+	}
+	p.StateDigest = stateDigest
+	return p, nil
+}
+
+// scanProposalRaw performs the strict field decode and validation shared by
+// verified loads and the v5 digest backfill. It returns the decoded proposal
+// and the row's stored state digest, which may be empty for legacy rows.
+func scanProposalRaw(row rowScanner) (*Proposal, string, error) {
 	var p Proposal
 	var tagsJSON, selectedJSON, conflictsJSON, findingsJSON sql.NullString
 	var createdAt string
 	var decidedAt, decidedBy, resultingID sql.NullString
 	var changesetID, baseID, headID, targetRef sql.NullString
+	var requestDigest, stateDigest sql.NullString
 	if err := row.Scan(
 		&p.ID, &p.ProjectID, &p.ProposedEventType, &p.Kind, &p.Content, &p.Reason,
 		&p.Confidence, &tagsJSON, &p.OriginatingPrincipal, &p.OriginatingClient,
 		&p.OriginatingProvider, &p.OriginatingSession, &p.RequestID, &p.IdempotencyKey,
 		&p.Status, &createdAt, &decidedAt, &decidedBy, &resultingID,
 		&changesetID, &baseID, &headID, &targetRef, &selectedJSON, &conflictsJSON, &findingsJSON,
+		&requestDigest, &stateDigest,
 	); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	p.CreatedAt = parseTime(createdAt)
+	corrupt := func(format string, args ...any) error {
+		return fmt.Errorf("%w: proposal %s: %s", ErrProposalCorrupt, p.ID, fmt.Sprintf(format, args...))
+	}
+
+	var err error
+	if p.CreatedAt, err = strictParseTime(createdAt); err != nil {
+		return nil, "", corrupt("created_at: %v", err)
+	}
 	if decidedAt.Valid {
-		t := parseTime(decidedAt.String)
+		t, err := strictParseTime(decidedAt.String)
+		if err != nil {
+			return nil, "", corrupt("decided_at: %v", err)
+		}
 		p.DecidedAt = &t
 	}
 	if decidedBy.Valid {
@@ -446,26 +808,77 @@ func scanProposal(row rowScanner) (*Proposal, error) {
 	if targetRef.Valid {
 		p.TargetRef = targetRef.String
 	}
-	_ = json.Unmarshal([]byte(tagsJSON.String), &p.Tags)
-	_ = json.Unmarshal([]byte(selectedJSON.String), &p.SelectedOps)
-	_ = json.Unmarshal([]byte(conflictsJSON.String), &p.ConflictIDs)
-	_ = json.Unmarshal([]byte(findingsJSON.String), &p.ReviewFindings)
+	if requestDigest.Valid {
+		p.RequestDigest = requestDigest.String
+	}
+
+	if err := json.Unmarshal([]byte(tagsJSON.String), &p.Tags); err != nil {
+		return nil, "", corrupt("tags JSON does not decode: %v", err)
+	}
+	if err := json.Unmarshal([]byte(selectedJSON.String), &p.SelectedOps); err != nil {
+		return nil, "", corrupt("selected_ops JSON does not decode: %v", err)
+	}
+	if err := json.Unmarshal([]byte(conflictsJSON.String), &p.ConflictIDs); err != nil {
+		return nil, "", corrupt("conflict_ids JSON does not decode: %v", err)
+	}
+	if err := json.Unmarshal([]byte(findingsJSON.String), &p.ReviewFindings); err != nil {
+		return nil, "", corrupt("review_findings JSON does not decode: %v", err)
+	}
 	p.Tags = nonNilStrings(p.Tags)
 	p.SelectedOps = nonNilInts(p.SelectedOps)
 	p.ConflictIDs = nonNilStrings(p.ConflictIDs)
 	if p.ReviewFindings == nil {
 		p.ReviewFindings = []ReviewFinding{}
 	}
-	return &p, nil
-}
 
-func parseTime(v string) time.Time {
-	for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02 15:04:05.999999999 -0700 MST", "2006-01-02 15:04:05"} {
-		if t, err := time.Parse(layout, v); err == nil {
-			return t
+	seenOrdinals := make(map[int]struct{}, len(p.SelectedOps))
+	for _, ordinal := range p.SelectedOps {
+		if ordinal < 0 {
+			return nil, "", corrupt("selected_ops contains negative ordinal %d", ordinal)
+		}
+		if _, dup := seenOrdinals[ordinal]; dup {
+			return nil, "", corrupt("selected_ops contains duplicate ordinal %d", ordinal)
+		}
+		seenOrdinals[ordinal] = struct{}{}
+	}
+	for _, id := range p.ConflictIDs {
+		if id == "" {
+			return nil, "", corrupt("conflict_ids contains an empty identifier")
 		}
 	}
-	return time.Time{}
+	for i, finding := range p.ReviewFindings {
+		if !validReviewVerdict(finding.Verdict) {
+			return nil, "", corrupt("review_findings[%d] has invalid verdict %q", i, finding.Verdict)
+		}
+		if finding.Reviewer == "" {
+			return nil, "", corrupt("review_findings[%d] has no reviewer", i)
+		}
+		if finding.CreatedAt.IsZero() {
+			return nil, "", corrupt("review_findings[%d] has no timestamp", i)
+		}
+		if finding.TargetHeadChangesetID == "" || !hexDigestPattern.MatchString(finding.TargetDigest) {
+			return nil, "", corrupt("review_findings[%d] is missing its target binding or digest", i)
+		}
+	}
+
+	if stateDigest.Valid {
+		p.StateDigest = stateDigest.String
+	}
+	return &p, stateDigest.String, nil
+}
+
+// strictParseTime parses persisted timestamps and rejects anything that does
+// not match a known storage format instead of silently returning zero time.
+func strictParseTime(v string) (time.Time, error) {
+	if v == "" {
+		return time.Time{}, errors.New("empty timestamp")
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02 15:04:05.999999999 -0700 MST", "2006-01-02 15:04:05"} {
+		if t, err := time.Parse(layout, v); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("unparseable timestamp %q", v)
 }
 
 func nullString(v string) any {
@@ -473,6 +886,15 @@ func nullString(v string) any {
 		return nil
 	}
 	return v
+}
+
+// isUniqueViolation reports whether err is a SQLite uniqueness violation.
+func isUniqueViolation(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unique constraint") || strings.Contains(msg, "constraint failed")
 }
 
 func nonNilStrings(v []string) []string {

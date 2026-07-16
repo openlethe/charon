@@ -1,132 +1,148 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
-# Charon Secure Setup Script
-# Generates .env, creates principals, mints initial tokens
-# Run once: ./setup.sh
+# Bootstrap the hardened single-host Charon container and create separate
+# author, reviewer, and reader principals. Credential values are written only
+# to mode-0600 files and are never printed.
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DATA_DIR="${SCRIPT_DIR}/charon-data"
-SECRETS_DIR="${SCRIPT_DIR}/secrets"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+env_file="${repo_root}/.env"
+secrets_dir="${repo_root}/secrets"
+project=${CHARON_PROJECT:-default}
+merge_key_input=${CHARON_MERGE_HMAC_KEY:-}
 
-# Create directories
-mkdir -p "$DATA_DIR" "$SECRETS_DIR"
-chmod 700 "$SECRETS_DIR"
+command -v docker >/dev/null || { echo "ERROR: Docker is required."; exit 1; }
+docker compose version >/dev/null || { echo "ERROR: Docker Compose v2 is required."; exit 1; }
+command -v openssl >/dev/null || { echo "ERROR: openssl is required."; exit 1; }
 
-# Generate secrets if .env doesn't exist
-ENV_FILE="${SCRIPT_DIR}/.env"
-if [[ ! -f "$ENV_FILE" ]]; then
-	 echo "Generating secure secrets..."
-	 
-	 LETHE_API_KEY="lethe_$(openssl rand -hex 32)"
-	 CHARON_HMAC_KEY="$(openssl rand -hex 32)"
-	 
-	 cat > "$ENV_FILE" << EOF
-# Charon Secure Configuration
-# Generated on $(date -u +%Y-%m-%dT%H:%M:%SZ)
-# DO NOT COMMIT TO GIT
+mkdir -p "$secrets_dir"
+chmod 700 "$secrets_dir"
 
-# Lethe API key (shared between Lethe and Charon)
+if [[ ! -f "$env_file" ]]; then
+    [[ -n ${LETHE_API_KEY:-} ]] || {
+        echo "ERROR: export the existing upstream LETHE_API_KEY before running setup.sh."
+        exit 1
+    }
+    [[ ${#merge_key_input} -ge 32 ]] || {
+        echo "ERROR: export CHARON_MERGE_HMAC_KEY after configuring the same value on Lethe (CHARON_MERGE_HMAC_KEY there; legacy CHARON_HMAC_KEY is still accepted)."
+        exit 1
+    }
+
+    obol_key=${CHARON_OBOL_HMAC_KEY:-$(openssl rand -hex 32)}
+    oauth_key=${CHARON_OAUTH_HMAC_KEY:-$(openssl rand -hex 32)}
+    pairing_secret=${CHARON_OAUTH_PAIRING_SECRET:-$(openssl rand -hex 32)}
+    public_url=${CHARON_PUBLIC_URL:-http://127.0.0.1:18484}
+    auth_mode=${CHARON_AUTH_MODE:-oauth}
+    upstream=${CHARON_UPSTREAM:-http://host.docker.internal:18485}
+    if [[ "$auth_mode" == oauth && -z ${CHARON_OAUTH_REDIRECT_URIS:-} ]]; then
+        echo "ERROR: export CHARON_OAUTH_REDIRECT_URIS before bootstrapping OAuth mode."
+        exit 1
+    fi
+
+    cat > "$env_file" <<EOF
 LETHE_API_KEY=${LETHE_API_KEY}
-
-# Charon HMAC key for Obol signing
-CHARON_HMAC_KEY=${CHARON_HMAC_KEY}
-
-# Public URL (update after creating Cloudflare Tunnel)
-CHARON_PUBLIC_URL=http://localhost:18484
-
-# Data directory for SQLite database (must match docker-compose volume)
-CHARON_DATA_DIR=${DATA_DIR}
-
-# Admin bind (Unix socket for security)
-CHARON_ADMIN_HTTP=/tmp/charon-admin.sock
+CHARON_UPSTREAM=${upstream}
+CHARON_MODE=memory-git
+CHARON_PUBLIC_URL=${public_url}
+CHARON_AUTH_MODE=${auth_mode}
+CHARON_OBOL_HMAC_KEY=${obol_key}
+CHARON_OAUTH_HMAC_KEY=${oauth_key}
+CHARON_MERGE_HMAC_KEY=${merge_key_input}
+CHARON_OAUTH_CLIENT_ID=${CHARON_OAUTH_CLIENT_ID:-chatgpt-mcp}
+CHARON_OAUTH_DEFAULT_USER=${CHARON_OAUTH_DEFAULT_USER:-}
+CHARON_OAUTH_REDIRECT_URIS=${CHARON_OAUTH_REDIRECT_URIS:-}
+CHARON_OAUTH_PAIRING_SECRET=${pairing_secret}
+CHARON_OAUTH_ALLOW_AUTHOR_SCOPES=${CHARON_OAUTH_ALLOW_AUTHOR_SCOPES:-false}
 EOF
-	 
-	 chmod 600 "$ENV_FILE"
-	 echo "✓ Created .env with generated secrets"
+    chmod 600 "$env_file"
+    echo "Created protected .env configuration. No secret values were printed."
 else
-	 echo "✓ .env already exists, loading..."
+    chmod 600 "$env_file"
+    echo "Using existing protected .env configuration."
 fi
 
-# Load .env
 set -a
-source "$ENV_FILE"
+# shellcheck disable=SC1090
+source "$env_file"
 set +a
 
-# Build Charon if needed
-if [[ ! -f "${SCRIPT_DIR}/bin/charon" ]]; then
-	 echo "Building Charon..."
-	 make -C "$SCRIPT_DIR" build
+cd "$repo_root"
+# Compose requires the served OAuth principal during interpolation. Bootstrap
+# commands run before that principal exists, so give only these one-off CLI
+# containers a non-persisted placeholder and write the reconciled ID below
+# before start.sh launches either gateway.
+bootstrap_default_user=${CHARON_OAUTH_DEFAULT_USER:-principal_bootstrap_placeholder}
+CHARON_OAUTH_DEFAULT_USER="$bootstrap_default_user" docker compose build charon
+charon_cli=(env CHARON_OAUTH_DEFAULT_USER="$bootstrap_default_user" docker compose run --rm --no-deps --entrypoint charon charon)
+reviewer_cli=(env CHARON_OAUTH_DEFAULT_USER="$bootstrap_default_user" docker compose run --rm --no-deps --entrypoint charon charon-reviewer)
+
+author_id=$("${charon_cli[@]}" principal reconcile "Local Memory Author" propose "$project" | awk '/^Reconciled principal:/ {print $3}')
+reviewer_id=$("${charon_cli[@]}" principal reconcile "Local Memory Reviewer" review "$project" | awk '/^Reconciled principal:/ {print $3}')
+reader_id=$("${charon_cli[@]}" principal reconcile "Local Memory Reader" readonly "$project" | awk '/^Reconciled principal:/ {print $3}')
+
+[[ -n "$author_id" && -n "$reviewer_id" && -n "$reader_id" ]] || {
+    echo "ERROR: principal reconciliation did not return all IDs."
+    exit 1
+}
+
+set_env_value() {
+    local key=$1
+    local value=$2
+    local temporary
+    temporary=$(mktemp)
+    awk -v key="$key" -v value="$value" '
+        BEGIN { replaced = 0 }
+        index($0, key "=") == 1 {
+            if (!replaced) {
+                print key "=" value
+                replaced = 1
+            }
+            next
+        }
+        { print }
+        END {
+            if (!replaced) print key "=" value
+        }
+    ' "$env_file" > "$temporary"
+    chmod 600 "$temporary"
+    mv "$temporary" "$env_file"
+}
+
+if [[ -z ${CHARON_OAUTH_DEFAULT_USER:-} ]]; then
+    set_env_value CHARON_OAUTH_DEFAULT_USER "$author_id"
 fi
 
-# Initialize database and create principals
- echo ""
- echo "=== Creating Principals ==="
+mint_to_file() {
+    local principal_id=$1
+    local destination=$2
+    local gateway=${3:-primary}
+    if [[ "$gateway" == reviewer ]]; then
+        "${reviewer_cli[@]}" obol mint --expires 7d "$principal_id" > "$destination"
+    else
+        "${charon_cli[@]}" obol mint --expires 7d "$principal_id" > "$destination"
+    fi
+    chmod 600 "$destination"
+}
 
-# OpenClaw principal (full access)
-ARCHIMEDES_ID=$("${SCRIPT_DIR}/bin/charon" principal create "OpenClaw (archimedes)" 2>> /dev/null | awk '{print $3}')
-echo "✓ OpenClaw principal: ${ARCHIMEDES_ID}"
+mint_to_file "$author_id" "${secrets_dir}/author-obol.txt"
+mint_to_file "$reviewer_id" "${secrets_dir}/reviewer-obol.txt" reviewer
+mint_to_file "$reader_id" "${secrets_dir}/reader-obol.txt"
 
-"${SCRIPT_DIR}/bin/charon" principal grant-project "$ARCHIMEDES_ID" default > /dev/null
-"${SCRIPT_DIR}/bin/charon" principal grant-scope "$ARCHIMEDES_ID" memory.search > /dev/null
-"${SCRIPT_DIR}/bin/charon" principal grant-scope "$ARCHIMEDES_ID" memory.read > /dev/null
-"${SCRIPT_DIR}/bin/charon" principal grant-scope "$ARCHIMEDES_ID" memory.propose > /dev/null
-"${SCRIPT_DIR}/bin/charon" principal grant-scope "$ARCHIMEDES_ID" memory.write > /dev/null
-echo "  → Full read+write access to 'default' project"
-
-# ChatGPT principal (read + propose only)
-CHATGPT_ID=$("${SCRIPT_DIR}/bin/charon" principal create "ChatGPT" 2>> /dev/null | awk '{print $3}')
-echo "✓ ChatGPT principal: ${CHATGPT_ID}"
-
-"${SCRIPT_DIR}/bin/charon" principal grant-project "$CHATGPT_ID" default > /dev/null
-"${SCRIPT_DIR}/bin/charon" principal grant-scope "$CHATGPT_ID" memory.search > /dev/null
-"${SCRIPT_DIR}/bin/charon" principal grant-scope "$CHATGPT_ID" memory.read > /dev/null
-"${SCRIPT_DIR}/bin/charon" principal grant-scope "$CHATGPT_ID" memory.propose > /dev/null
-echo "  → Read + propose access to 'default' project"
-
-# Claude principal (read + propose only)
-CLAUDE_ID=$("${SCRIPT_DIR}/bin/charon" principal create "Claude" 2>> /dev/null | awk '{print $3}')
-echo "✓ Claude principal: ${CLAUDE_ID}"
-
-"${SCRIPT_DIR}/bin/charon" principal grant-project "$CLAUDE_ID" default > /dev/null
-"${SCRIPT_DIR}/bin/charon" principal grant-scope "$CLAUDE_ID" memory.search > /dev/null
-"${SCRIPT_DIR}/bin/charon" principal grant-scope "$CLAUDE_ID" memory.read > /dev/null
-"${SCRIPT_DIR}/bin/charon" principal grant-scope "$CLAUDE_ID" memory.propose > /dev/null
-echo "  → Read + propose access to 'default' project"
-
-# Mint initial tokens (7-day expiry)
-echo ""
-echo "=== Minting Initial Tokens (7-day expiry) ==="
-
-"${SCRIPT_DIR}/bin/charon" obol mint "$ARCHIMEDES_ID" --expires 7d > "${SECRETS_DIR}/archimedes-obol.txt"
-chmod 600 "${SECRETS_DIR}/archimedes-obol.txt"
-echo "✓ OpenClaw token → secrets/archimedes-obol.txt"
-
-"${SCRIPT_DIR}/bin/charon" obol mint "$CHATGPT_ID" --expires 7d > "${SECRETS_DIR}/chatgpt-obol.txt"
-chmod 600 "${SECRETS_DIR}/chatgpt-obol.txt"
-echo "✓ ChatGPT token → secrets/chatgpt-obol.txt"
-
-"${SCRIPT_DIR}/bin/charon" obol mint "$CLAUDE_ID" --expires 7d > "${SECRETS_DIR}/claude-obol.txt"
-chmod 600 "${SECRETS_DIR}/claude-obol.txt"
-echo "✓ Claude token → secrets/claude-obol.txt"
-
-# Save principal IDs for rotation script
-cat > "${SECRETS_DIR}/principal-ids.txt" << EOF
-ARCHIMEDES_ID=${ARCHIMEDES_ID}
-CHATGPT_ID=${CHATGPT_ID}
-CLAUDE_ID=${CLAUDE_ID}
+cat > "${secrets_dir}/principal-ids.txt" <<EOF
+AUTHOR_ID=${author_id}
+REVIEWER_ID=${reviewer_id}
+READER_ID=${reader_id}
 EOF
-chmod 600 "${SECRETS_DIR}/principal-ids.txt"
+chmod 600 "${secrets_dir}/principal-ids.txt"
 
-echo ""
-echo "=== Setup Complete ==="
-echo ""
-echo "Next steps:"
-echo "  1. Update CHARON_PUBLIC_URL in .env after creating Cloudflare Tunnel"
-echo "  2. Start services: docker-compose up -d"
-echo "  3. Rotate tokens weekly: ./scripts/rotate-tokens.sh"
-echo ""
-echo "Token locations:"
-echo "  - secrets/archimedes-obol.txt (OpenClaw)"
-echo "  - secrets/chatgpt-obol.txt (ChatGPT)"
-echo "  - secrets/claude-obol.txt (Claude)"
+"${repo_root}/start.sh"
+
+cat <<EOF
+Charon bootstrap completed for project ${project}.
+Credentials were stored under secrets/ with mode 0600:
+  - author-obol.txt
+  - reviewer-obol.txt
+  - reader-obol.txt
+No credential values were printed.
+EOF

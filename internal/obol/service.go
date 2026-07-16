@@ -65,7 +65,11 @@ func (s *Service) Mint(ctx context.Context, principalID, audience string, expire
 		return nil, fmt.Errorf("principal not found: %s", principalID)
 	}
 
-	id := uuid.Must(uuid.NewV7()).String()
+	credentialID, err := uuid.NewV7()
+	if err != nil {
+		return nil, fmt.Errorf("generate credential ID: %w", err)
+	}
+	id := credentialID.String()
 	secret := make([]byte, 32)
 	if _, err := rand.Read(secret); err != nil {
 		return nil, fmt.Errorf("generate secret: %w", err)
@@ -91,7 +95,7 @@ func (s *Service) Mint(ctx context.Context, principalID, audience string, expire
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO obols (id, principal_id, secret_digest, audience, expires_at, revoked_at, created_at, last_used_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, id, principalID, digest, audience, nilIfNil(expiresAt), nil, createdAt, nil)
+	`, id, principalID, digest, audience, storedTimeValue(expiresAt), nil, createdAt.Format(time.RFC3339Nano), nil)
 	if err != nil {
 		return nil, fmt.Errorf("insert obol: %w", err)
 	}
@@ -155,8 +159,8 @@ func (s *Service) Verify(ctx context.Context, token, audience string) (string, e
 	}
 
 	if expiresAtStr.Valid && expiresAtStr.String != "" {
-		expiresAt, err := time.Parse(time.RFC3339, expiresAtStr.String)
-		if err == nil && time.Now().UTC().After(expiresAt) {
+		expiresAt, err := parseStoredTime(expiresAtStr.String)
+		if err != nil || time.Now().UTC().After(expiresAt) {
 			return "", ErrInvalidObol
 		}
 	}
@@ -202,27 +206,44 @@ func (s *Service) List(ctx context.Context, principalID string) ([]*Obol, error)
 		var o Obol
 		var expiresAtStr sql.NullString
 		var revokedAtStr sql.NullString
+		var createdAtStr sql.NullString
 		var lastUsedAtStr sql.NullString
 
+		// Scan timestamps as strings (modernc.org/sqlite compatibility), then
+		// parse them like Verify does.
 		if err := rows.Scan(&o.ID, &o.PrincipalID, &o.Audience,
-			&expiresAtStr, &revokedAtStr, &o.CreatedAt, &lastUsedAtStr); err != nil {
+			&expiresAtStr, &revokedAtStr, &createdAtStr, &lastUsedAtStr); err != nil {
 			return nil, fmt.Errorf("scan obol: %w", err)
 		}
 
-		if expiresAtStr.Valid && expiresAtStr.String != "" {
-			if t, err := time.Parse(time.RFC3339, expiresAtStr.String); err == nil {
-				o.ExpiresAt = &t
+		if createdAtStr.Valid && createdAtStr.String != "" {
+			t, err := parseStoredTime(createdAtStr.String)
+			if err != nil {
+				return nil, fmt.Errorf("parse obol %s creation time: %w", o.ID, err)
 			}
+			o.CreatedAt = t
+		}
+
+		if expiresAtStr.Valid && expiresAtStr.String != "" {
+			t, err := parseStoredTime(expiresAtStr.String)
+			if err != nil {
+				return nil, fmt.Errorf("parse obol %s expiry: %w", o.ID, err)
+			}
+			o.ExpiresAt = &t
 		}
 		if revokedAtStr.Valid && revokedAtStr.String != "" {
-			if t, err := time.Parse(time.RFC3339, revokedAtStr.String); err == nil {
-				o.RevokedAt = &t
+			t, err := parseStoredTime(revokedAtStr.String)
+			if err != nil {
+				return nil, fmt.Errorf("parse obol %s revocation: %w", o.ID, err)
 			}
+			o.RevokedAt = &t
 		}
 		if lastUsedAtStr.Valid && lastUsedAtStr.String != "" {
-			if t, err := time.Parse(time.RFC3339, lastUsedAtStr.String); err == nil {
-				o.LastUsedAt = &t
+			t, err := parseStoredTime(lastUsedAtStr.String)
+			if err != nil {
+				return nil, fmt.Errorf("parse obol %s last-used time: %w", o.ID, err)
 			}
+			o.LastUsedAt = &t
 		}
 		obols = append(obols, &o)
 	}
@@ -230,9 +251,23 @@ func (s *Service) List(ctx context.Context, principalID string) ([]*Obol, error)
 	return obols, rows.Err()
 }
 
-func nilIfNil(t *time.Time) interface{} {
+func storedTimeValue(t *time.Time) interface{} {
 	if t == nil {
 		return nil
 	}
-	return *t
+	return t.UTC().Format(time.RFC3339Nano)
+}
+
+func parseStoredTime(value string) (time.Time, error) {
+	layouts := []string{
+		time.RFC3339Nano,
+		"2006-01-02 15:04:05.999999999 -0700 MST",
+		"2006-01-02 15:04:05.999999999 -0700",
+	}
+	for _, layout := range layouts {
+		if parsed, err := time.Parse(layout, value); err == nil {
+			return parsed.UTC(), nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("unsupported stored timestamp format")
 }

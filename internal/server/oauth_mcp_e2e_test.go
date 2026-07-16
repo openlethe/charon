@@ -21,6 +21,8 @@ import (
 	"github.com/openlethe/charon/internal/store"
 )
 
+const testOAuthPairingSecret = "pairing-secret-at-least-32-characters"
+
 func TestOAuthMCPReturnsV04LetheMemory(t *testing.T) {
 	lethe := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer upstream-private-key" {
@@ -52,6 +54,7 @@ func TestOAuthMCPReturnsV04LetheMemory(t *testing.T) {
 		OAuthClientID:      "chatgpt-mcp",
 		OAuthDefaultUserID: "chatgpt",
 		OAuthRedirectURIs:  []string{"http://127.0.0.1/callback"},
+		OAuthPairingSecret: testOAuthPairingSecret,
 		LetheAPIKey:        "upstream-private-key",
 		HMACKey:            "0123456789abcdef0123456789abcdef",
 		MaxResultBytes:     1 << 20,
@@ -98,8 +101,8 @@ func TestOAuthMCPReturnsV04LetheMemory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MCP list tools: %v", err)
 	}
-	if len(tools.Tools) != 21 {
-		t.Fatalf("tool count = %d, want 21", len(tools.Tools))
+	if len(tools.Tools) != 23 {
+		t.Fatalf("tool count = %d, want 23", len(tools.Tools))
 	}
 
 	request := mcp.CallToolRequest{}
@@ -119,6 +122,61 @@ func TestOAuthMCPReturnsV04LetheMemory(t *testing.T) {
 	}
 }
 
+func TestOAuthMemoryGitAuthorScopesOptInIsWiredEndToEnd(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open Charon store: %v", err)
+	}
+	defer db.Close()
+	if _, _, err := db.ReconcilePrincipal(context.Background(), "chatgpt-memory-git", []string{"Archimedes"}, []string{
+		"memory.search", "memory.read", "thread.read", "memory.propose", "memory.branch", "memory.commit", "memory.write",
+	}); err != nil {
+		t.Fatalf("reconcile principal: %v", err)
+	}
+
+	cfg := &config.Config{
+		Mode:                   config.ModeMemoryGit,
+		Upstream:               "http://127.0.0.1:1",
+		PublicURL:              "https://charon.example.test",
+		OAuthClientID:          "chatgpt-mcp",
+		OAuthDefaultUserID:     "chatgpt-memory-git",
+		OAuthRedirectURIs:      []string{"http://127.0.0.1/callback"},
+		OAuthAllowAuthorScopes: true,
+		OAuthPairingSecret:     testOAuthPairingSecret,
+		LetheAPIKey:            "upstream-test-key",
+		HMACKey:                "0123456789abcdef0123456789abcdef",
+		MaxResultBytes:         1 << 20,
+		MaxResultCount:         100,
+		RequestTimeout:         time.Second,
+		AuthMode:               "oauth",
+	}
+	charon, err := NewServer(cfg, db, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	handler, err := charon.Handler()
+	if err != nil {
+		t.Fatalf("Handler: %v", err)
+	}
+	public := httptest.NewServer(handler)
+	defer public.Close()
+
+	token := exchangeOAuthToken(t, public.URL)
+	claims, err := charon.oauthSvc.ValidateAccessToken(token)
+	if err != nil {
+		t.Fatalf("validate OAuth token: %v", err)
+	}
+	got := scopeSet(claims.Scopes)
+	for _, scope := range []string{"memory.branch", "memory.commit", "memory.propose", "memory.read"} {
+		if _, ok := got[scope]; !ok {
+			t.Fatalf("OAuth token missing %s: %v", scope, claims.Scopes)
+		}
+	}
+	if _, ok := got["memory.write"]; ok {
+		t.Fatalf("OAuth token retained direct-write scope: %v", claims.Scopes)
+	}
+}
+
 func TestOAuthMissingPrincipalFailsClosed(t *testing.T) {
 	db, err := store.Open(t.TempDir())
 	if err != nil {
@@ -132,6 +190,7 @@ func TestOAuthMissingPrincipalFailsClosed(t *testing.T) {
 		OAuthClientID:      "chatgpt-mcp",
 		OAuthDefaultUserID: "chatgpt",
 		OAuthRedirectURIs:  []string{"http://127.0.0.1/callback"},
+		OAuthPairingSecret: testOAuthPairingSecret,
 		LetheAPIKey:        "upstream-test-key",
 		HMACKey:            "0123456789abcdef0123456789abcdef",
 		MaxResultBytes:     1 << 20,
@@ -179,12 +238,22 @@ func exchangeOAuthToken(t *testing.T, baseURL string) string {
 	httpClient := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	resp, err := httpClient.Get(baseURL + "/oauth/authorize?" + params.Encode())
 	if err != nil {
-		t.Fatalf("authorize: %v", err)
+		t.Fatalf("authorize page: %v", err)
 	}
-	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "Authorization key") {
+		t.Fatalf("authorize page status = %d: %s", resp.StatusCode, body)
+	}
+
+	params.Set("pairing_secret", testOAuthPairingSecret)
+	resp, err = httpClient.PostForm(baseURL+"/oauth/authorize", params)
+	if err != nil {
+		t.Fatalf("authorize pairing: %v", err)
+	}
+	resp.Body.Close()
 	if resp.StatusCode != http.StatusFound {
-		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("authorize status = %d: %s", resp.StatusCode, body)
+		t.Fatalf("authorize pairing status = %d", resp.StatusCode)
 	}
 	location, err := url.Parse(resp.Header.Get("Location"))
 	if err != nil {

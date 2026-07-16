@@ -3,6 +3,8 @@ package proposal
 import (
 	"context"
 	"fmt"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/openlethe/charon/internal/store"
@@ -71,7 +73,7 @@ func TestCreateAndGet(t *testing.T) {
 	}
 }
 
-func TestApprove(t *testing.T) {
+func TestLegacyApproveFailsClosedWithoutChangingProposal(t *testing.T) {
 	dir := t.TempDir()
 	db, err := store.Open(dir)
 	if err != nil {
@@ -81,34 +83,24 @@ func TestApprove(t *testing.T) {
 
 	svc := NewService(db, nil)
 	ctx := context.Background()
-
-	req := CreateRequest{
-		ProjectID:      "charon",
-		EventType:      "record",
-		Kind:           "decision",
-		Content:        "Test content",
-		IdempotencyKey: "test-key-2",
-		RequestID:      "req-2",
-		Provenance:     Provenance{Principal: "p1"},
-	}
-
-	p, _ := svc.Create(ctx, req)
-
-	approved, err := svc.Approve(ctx, ApproveRequest{ProposalID: p.ID, DecidedBy: "admin"})
+	p, err := svc.Create(ctx, CreateRequest{
+		ProjectID: "charon", EventType: "record", Kind: "decision", Content: "Test content",
+		IdempotencyKey: "test-key-2", RequestID: "req-2", Provenance: Provenance{Principal: "p1"},
+	})
 	if err != nil {
-		t.Fatalf("approve: %v", err)
-	}
-	if approved.Status != StatusApproved {
-		t.Errorf("expected approved, got %s", approved.Status)
-	}
-	if approved.DecidedBy != "admin" {
-		t.Errorf("expected admin, got %s", approved.DecidedBy)
+		t.Fatal(err)
 	}
 
-	// Re-approve should return existing (idempotency)
-	_, err = svc.Approve(ctx, ApproveRequest{ProposalID: p.ID, DecidedBy: "admin"})
-	if err == nil {
-		t.Error("expected error for already approved proposal")
+	got, err := svc.Approve(ctx, ApproveRequest{ProposalID: p.ID, DecidedBy: "admin"})
+	if err == nil || !strings.Contains(err.Error(), "not idempotent") {
+		t.Fatalf("expected fail-closed approval error, got %#v, %v", got, err)
+	}
+	stored, err := svc.Get(ctx, p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != StatusPending || stored.ResultingLetheEventID != "" || stored.DecidedBy != "" {
+		t.Fatalf("legacy approval mutated proposal: %#v", stored)
 	}
 }
 
@@ -218,9 +210,16 @@ func TestMemoryGitMergeRequestUsesExistingProposalLifecycle(t *testing.T) {
 		t.Fatal("merge result was allowed to change")
 	}
 
-	got, err = svc.AddReviewFinding(ctx, p.ID, ReviewFinding{Reviewer: "reviewer", Comment: "scope checked"})
+	got, err = svc.AddReviewFinding(ctx, p.ID, ReviewFinding{
+		Reviewer: "reviewer", Verdict: ReviewVerdictApprove, Comment: "scope checked",
+		TargetHeadChangesetID: "target-head-1",
+	})
 	if err != nil || len(got.ReviewFindings) != 1 || got.ReviewFindings[0].Reviewer != "reviewer" {
 		t.Fatalf("review finding = %#v, %v", got, err)
+	}
+	if got.ReviewFindings[0].Verdict != ReviewVerdictApprove ||
+		got.ReviewFindings[0].TargetDigest != ReviewTargetDigest(got, "target-head-1") {
+		t.Fatalf("review decision was not bound to proposal state: %#v", got.ReviewFindings[0])
 	}
 	if _, err := svc.CompleteMerge(ctx, p.ID, "author", "merge-result-1"); err == nil {
 		t.Fatal("originator was allowed to approve its own merge")
@@ -231,6 +230,65 @@ func TestMemoryGitMergeRequestUsesExistingProposalLifecycle(t *testing.T) {
 	}
 	if approved.Status != StatusApproved || approved.ResultingLetheEventID != "merge-result-1" {
 		t.Fatalf("approved merge = %#v", approved)
+	}
+}
+
+func TestConcurrentReviewFindingsAppendAtomically(t *testing.T) {
+	dir := t.TempDir()
+	db1, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db1.Close()
+	db2, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+
+	first := NewService(db1, nil)
+	second := NewService(db2, nil)
+	proposal, err := first.Create(context.Background(), CreateRequest{
+		ProjectID: "project-1", EventType: "merge_request", Kind: "merge_request",
+		Provenance: Provenance{Principal: "author"}, IdempotencyKey: "concurrent-reviews",
+		BaseChangesetID: "base", HeadChangesetID: "head", TargetRef: "refs/shared/main",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const reviewers = 32
+	var wg sync.WaitGroup
+	errCh := make(chan error, reviewers)
+	for i := 0; i < reviewers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			svc := first
+			if i%2 == 1 {
+				svc = second
+			}
+			_, err := svc.AddReviewFinding(context.Background(), proposal.ID, ReviewFinding{
+				Reviewer: fmt.Sprintf("reviewer-%d", i), Verdict: ReviewVerdictApprove,
+				Comment: "reviewed", TargetHeadChangesetID: "target-head",
+			})
+			errCh <- err
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("append concurrent review: %v", err)
+		}
+	}
+
+	got, err := first.Get(context.Background(), proposal.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.ReviewFindings) != reviewers {
+		t.Fatalf("review count = %d, want %d", len(got.ReviewFindings), reviewers)
 	}
 }
 

@@ -1,21 +1,62 @@
-# Binaries
-charon
-charon.exe
-*.exe
-
-# Build output
+# Compiled binaries and build output
+/charon
+/charon.exe
+/memory-git-e2e
+/bin/*
+!/bin/charon
 /dist/
+*.exe
+*.test
+*.out
+
+# Go coverage, profiling, and test artifacts
+/coverage/
+coverage.out
+coverage.html
+*.coverprofile
+*.prof
+*.pprof
 
 # Runtime state (never publish memory, auth metadata, WALs, or generated secrets)
 /charon-data/
+/charon-memory-git-data/
 /lethe-data/
+/secrets/
+/workspace/
+/code/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.obol
+.secrets
 
-# IDE
+# Local environment and shell configuration
+.env
+.env.*
+!.env.example
+!.env.minimal
+.envrc
+.direnv/
+
+# Local backups, logs, caches, and temporary files
+/docker-compose.yaml.backup
+*.bak
+*.backup
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+.cache/
+/tmp/
+
+# IDE and editor metadata
 .vscode/
 .idea/
+.fleet/
 
-# OS
+# OS metadata
 .DS_Store
 Thumbs.db
-.env
-.secrets

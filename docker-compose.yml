@@ -1,42 +1,117 @@
 services:
   charon:
-    build: .
-    environment:
-      - CHARON_MODE=direct
-      - CHARON_HTTP=:18484
-      - CHARON_ADMIN_HTTP=/tmp/charon-admin.sock
-      - CHARON_UPSTREAM=${CHARON_UPSTREAM:-http://host.docker.internal:18483}
-      - CHARON_PUBLIC_URL=${CHARON_PUBLIC_URL:-http://localhost:18484}
-      - LETHE_API_KEY=${LETHE_API_KEY}
-      - CHARON_HMAC_KEY=${CHARON_HMAC_KEY:-}
-      - CHARON_DATA_DIR=/data
-      - CHARON_AUTH_MODE=${CHARON_AUTH_MODE:-obol}
-      - CHARON_OAUTH_CLIENT_ID=${CHARON_OAUTH_CLIENT_ID:-chatgpt-mcp}
-      - CHARON_OAUTH_DEFAULT_USER=${CHARON_OAUTH_DEFAULT_USER:-}
-      - CHARON_OAUTH_REDIRECT_URIS=${CHARON_OAUTH_REDIRECT_URIS:-}
-      # Auto-bootstrap (optional)
-      - CHARON_AUTO_USER=${CHARON_AUTO_USER:-}
-      - CHARON_AUTO_PERMISSION=${CHARON_AUTO_PERMISSION:-readonly}
-      - CHARON_AUTO_PROJECT=${CHARON_AUTO_PROJECT:-default}
-      - CHARON_AUTO_PROJECTS=${CHARON_AUTO_PROJECTS:-}
-      - CHARON_AUTO_EXPIRES=${CHARON_AUTO_EXPIRES:-7d}
-    volumes:
-      - ./charon-data:/data
-      - ./secrets:/secrets:ro
-      - ./workspace:/workspace:rw
-      - ./code:/code:ro
-    networks:
-      - edge
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    ports:
-      - "18484:18484"
+    build:
+      context: .
+    image: charon:local
     restart: unless-stopped
+    init: true
+    environment:
+      CHARON_MODE: ${CHARON_MODE:-memory-git}
+      CHARON_HTTP: :18484
+      CHARON_ADMIN_HTTP: /tmp/charon-admin.sock
+      CHARON_UPSTREAM: ${CHARON_UPSTREAM:-http://host.docker.internal:18485}
+      CHARON_PUBLIC_URL: ${CHARON_PUBLIC_URL:?CHARON_PUBLIC_URL is required}
+      LETHE_API_KEY: ${LETHE_API_KEY:?LETHE_API_KEY is required}
+      # Migration fallback for existing installations. New deployments should
+      # set the three purpose-specific keys below and leave this unset.
+      CHARON_HMAC_KEY: ${CHARON_HMAC_KEY:-}
+      CHARON_OBOL_HMAC_KEY: ${CHARON_OBOL_HMAC_KEY:-}
+      CHARON_OAUTH_HMAC_KEY: ${CHARON_OAUTH_HMAC_KEY:-}
+      CHARON_MERGE_HMAC_KEY: ${CHARON_MERGE_HMAC_KEY:-}
+      CHARON_DATA_DIR: /data
+      # The public MCP gateway is OAuth-only. Local reviewer traffic uses the
+      # separate loopback-only service below.
+      CHARON_AUTH_MODE: oauth
+      CHARON_OAUTH_CLIENT_ID: ${CHARON_OAUTH_CLIENT_ID:-chatgpt-mcp}
+      CHARON_OAUTH_DEFAULT_USER: ${CHARON_OAUTH_DEFAULT_USER:?CHARON_OAUTH_DEFAULT_USER is required}
+      CHARON_OAUTH_REDIRECT_URIS: ${CHARON_OAUTH_REDIRECT_URIS:-}
+      CHARON_OAUTH_PAIRING_SECRET: ${CHARON_OAUTH_PAIRING_SECRET:-}
+      CHARON_OAUTH_GENERATE_PAIRING_SECRET: ${CHARON_OAUTH_GENERATE_PAIRING_SECRET:-true}
+      CHARON_OAUTH_ALLOW_AUTHOR_SCOPES: ${CHARON_OAUTH_ALLOW_AUTHOR_SCOPES:-false}
+      CHARON_AUTO_USER: ${CHARON_AUTO_USER:-}
+      CHARON_AUTO_PERMISSION: ${CHARON_AUTO_PERMISSION:-readonly}
+      CHARON_AUTO_PROJECT: ${CHARON_AUTO_PROJECT:-default}
+      CHARON_AUTO_PROJECTS: ${CHARON_AUTO_PROJECTS:-}
+      CHARON_AUTO_EXPIRES: ${CHARON_AUTO_EXPIRES:-7d}
+      CHARON_MAX_REQUEST_BYTES: ${CHARON_MAX_REQUEST_BYTES:-1048576}
+      CHARON_MAX_RESULT_BYTES: ${CHARON_MAX_RESULT_BYTES:-1048576}
+      CHARON_MAX_RESULT_COUNT: ${CHARON_MAX_RESULT_COUNT:-100}
+      CHARON_REQUEST_TIMEOUT: ${CHARON_REQUEST_TIMEOUT:-10s}
+    volumes:
+      - charon-data:/data
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    ports:
+      - 127.0.0.1:18484:18484
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,uid=10001,gid=10001,mode=0700
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 1.0
+    stop_grace_period: 20s
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:18484/health"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:18484/livez"]
       interval: 30s
       timeout: 5s
       retries: 3
+      start_period: 10s
 
-networks:
-  edge: {}
+  charon-reviewer:
+    build:
+      context: .
+    image: charon:local
+    restart: unless-stopped
+    init: true
+    depends_on:
+      charon:
+        condition: service_healthy
+    environment:
+      CHARON_MODE: ${CHARON_MODE:-memory-git}
+      CHARON_HTTP: :18484
+      CHARON_ADMIN_HTTP: /tmp/charon-admin.sock
+      CHARON_UPSTREAM: ${CHARON_UPSTREAM:-http://host.docker.internal:18485}
+      CHARON_PUBLIC_URL: ${CHARON_REVIEWER_PUBLIC_URL:-http://127.0.0.1:18486}
+      LETHE_API_KEY: ${LETHE_API_KEY:?LETHE_API_KEY is required}
+      CHARON_HMAC_KEY: ${CHARON_HMAC_KEY:-}
+      CHARON_OBOL_HMAC_KEY: ${CHARON_OBOL_HMAC_KEY:-}
+      CHARON_OAUTH_HMAC_KEY: ${CHARON_OAUTH_HMAC_KEY:-}
+      CHARON_MERGE_HMAC_KEY: ${CHARON_MERGE_HMAC_KEY:-}
+      CHARON_DATA_DIR: /data
+      # This listener is reachable only from loopback and accepts reviewer
+      # Obols; it does not expose OAuth authorization routes.
+      CHARON_AUTH_MODE: obol
+      CHARON_MAX_REQUEST_BYTES: ${CHARON_MAX_REQUEST_BYTES:-1048576}
+      CHARON_MAX_RESULT_BYTES: ${CHARON_MAX_RESULT_BYTES:-1048576}
+      CHARON_MAX_RESULT_COUNT: ${CHARON_MAX_RESULT_COUNT:-100}
+      CHARON_REQUEST_TIMEOUT: ${CHARON_REQUEST_TIMEOUT:-10s}
+    volumes:
+      - charon-data:/data
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    ports:
+      - 127.0.0.1:18486:18484
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,uid=10001,gid=10001,mode=0700
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 1.0
+    stop_grace_period: 20s
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:18484/livez"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  charon-data:

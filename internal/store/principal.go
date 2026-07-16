@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -17,30 +18,46 @@ func (db *DB) ReconcilePrincipal(ctx context.Context, name string, projects, sco
 	}
 	defer tx.Rollback()
 
-	rows, err := tx.QueryContext(ctx, "SELECT id FROM principals WHERE name = ? ORDER BY id LIMIT 2", name)
+	rows, err := tx.QueryContext(ctx, "SELECT id, disabled_at IS NOT NULL FROM principals WHERE name = ? ORDER BY id LIMIT 2", name)
 	if err != nil {
 		return "", false, fmt.Errorf("find principal: %w", err)
 	}
-	var ids []string
+	type principalMatch struct {
+		id       string
+		disabled bool
+	}
+	var matches []principalMatch
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return "", false, fmt.Errorf("scan principal: %w", err)
+		var match principalMatch
+		if err := rows.Scan(&match.id, &match.disabled); err != nil {
+			scanErr := fmt.Errorf("scan principal: %w", err)
+			if closeErr := rows.Close(); closeErr != nil {
+				return "", false, errors.Join(scanErr, fmt.Errorf("close principal rows: %w", closeErr))
+			}
+			return "", false, scanErr
 		}
-		ids = append(ids, id)
+		matches = append(matches, match)
+	}
+	if err := rows.Err(); err != nil {
+		if closeErr := rows.Close(); closeErr != nil {
+			return "", false, errors.Join(fmt.Errorf("iterate principals: %w", err), fmt.Errorf("close principal rows: %w", closeErr))
+		}
+		return "", false, fmt.Errorf("iterate principals: %w", err)
 	}
 	if err := rows.Close(); err != nil {
 		return "", false, fmt.Errorf("close principal rows: %w", err)
 	}
-	if len(ids) > 1 {
+	if len(matches) > 1 {
 		return "", false, fmt.Errorf("multiple principals named %q; reconcile by unique name is unsafe", name)
 	}
 
 	created := false
 	var principalID string
-	if len(ids) == 1 {
-		principalID = ids[0]
+	if len(matches) == 1 {
+		if matches[0].disabled {
+			return "", false, fmt.Errorf("principal %q is disabled; enable it explicitly before reconciliation", name)
+		}
+		principalID = matches[0].id
 	} else {
 		principalID, err = newPrincipalID()
 		if err != nil {

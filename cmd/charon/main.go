@@ -5,11 +5,15 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"os"
+	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/openlethe/charon/internal/config"
@@ -21,15 +25,23 @@ import (
 	"github.com/openlethe/charon/internal/upstream/lethe"
 )
 
+var (
+	version   = "dev"
+	commit    = "unknown"
+	buildDate = "unknown"
+)
+
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "Usage: charon <serve|obol|principal|proposal|ledger>")
+		fmt.Fprintln(os.Stderr, "Usage: charon <serve|version|obol|principal|proposal|ledger>")
 		os.Exit(1)
 	}
 
 	cmd := os.Args[1]
 
 	switch cmd {
+	case "version":
+		fmt.Println(versionInfo())
 	case "serve":
 		if err := runServe(); err != nil {
 			log.Fatal(err)
@@ -56,12 +68,17 @@ func main() {
 	}
 }
 
+func versionInfo() string {
+	return fmt.Sprintf("charon %s (commit %s, built %s, go %s)", version, commit, buildDate, runtime.Version())
+}
+
 func runServe() error {
 	cfg, err := config.FromEnv()
 	if err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
 
+	writeOAuthAuthorizationKeyBanner(os.Stderr, cfg)
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 
 	db, err := store.Open(cfg.DataDir)
@@ -72,22 +89,50 @@ func runServe() error {
 
 	logger.Info("starting charon", "mode", cfg.Mode, "upstream", cfg.Upstream)
 
-	// Print OAuth configuration for easy client setup
-	if cfg.AuthMode == "oauth" {
-		logger.Info("oauth configuration",
-			"client_id", cfg.OAuthClientID,
-			"metadata_url", cfg.PublicURL+"/.well-known/oauth-protected-resource",
-			"authorize_url", cfg.PublicURL+"/oauth/authorize",
-			"token_url", cfg.PublicURL+"/oauth/token",
-		)
-	}
+	logOAuthConfiguration(logger, cfg)
 
 	srv, err := server.NewServer(cfg, db, logger)
 	if err != nil {
 		return fmt.Errorf("server: %w", err)
 	}
 
-	return srv.Start()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return srv.Start(ctx)
+}
+
+func logOAuthConfiguration(logger *slog.Logger, cfg *config.Config) {
+	if cfg.AuthMode != "oauth" {
+		return
+	}
+
+	logger.Info("oauth configuration",
+		"client_id", cfg.OAuthClientID,
+		"metadata_url", cfg.PublicURL+"/.well-known/oauth-protected-resource",
+		"authorize_url", cfg.PublicURL+"/oauth/authorize",
+		"token_url", cfg.PublicURL+"/oauth/token",
+	)
+	if cfg.OAuthPairingSecretGenerated {
+		logger.Warn("oauth authorization key generated; treat container logs as sensitive")
+		return
+	}
+	logger.Info("oauth authorization key loaded from configuration; value not logged")
+}
+
+func writeOAuthAuthorizationKeyBanner(w io.Writer, cfg *config.Config) {
+	if cfg.AuthMode != "oauth" || !cfg.OAuthPairingSecretGenerated {
+		return
+	}
+
+	const border = "+------------------------------------------------------------------+"
+	fmt.Fprintln(w, border)
+	fmt.Fprintln(w, "|  CHARON OAUTH AUTHORIZATION KEY                                  |")
+	fmt.Fprintln(w, border)
+	fmt.Fprintf(w, "|  %-64s|\n", cfg.OAuthPairingSecret)
+	fmt.Fprintln(w, border)
+	fmt.Fprintln(w, "|  Paste this key into the browser authorization page.             |")
+	fmt.Fprintln(w, "|  A new key is generated whenever this container restarts.        |")
+	fmt.Fprintln(w, border)
 }
 
 func runObol() error {
@@ -110,7 +155,7 @@ func runObol() error {
 	}
 	defer db.Close()
 
-	obolSvc := obol.NewService(db, cfg.HMACKey)
+	obolSvc := obol.NewService(db, cfg.ObolKey())
 
 	switch sub {
 	case "mint":
@@ -201,7 +246,7 @@ func runObol() error {
 
 func runPrincipal() error {
 	if len(os.Args) < 3 {
-		fmt.Fprintln(os.Stderr, "Usage: charon principal <create|grant-project|grant-scope|reconcile>")
+		fmt.Fprintln(os.Stderr, "Usage: charon principal <create|grant-project|grant-scope|reconcile|disable|enable>")
 		os.Exit(1)
 	}
 
@@ -222,7 +267,7 @@ func runPrincipal() error {
 	switch sub {
 	case "reconcile":
 		if len(os.Args) < 6 {
-			fmt.Fprintln(os.Stderr, "Usage: charon principal reconcile <name> <readonly|propose|write> <project[,project...]> ")
+			fmt.Fprintln(os.Stderr, "Usage: charon principal reconcile <name> <readonly|propose|review|write> <project[,project...]> ")
 			os.Exit(1)
 		}
 		name := os.Args[3]
@@ -251,8 +296,12 @@ func runPrincipal() error {
 			os.Exit(1)
 		}
 		name := os.Args[3]
-		id := fmt.Sprintf("principal_%s", generateID())
-		_, err := db.ExecContext(ctx,
+		randomID, err := generateID()
+		if err != nil {
+			return err
+		}
+		id := fmt.Sprintf("principal_%s", randomID)
+		_, err = db.ExecContext(ctx,
 			"INSERT INTO principals (id, name, agent_id, created_at) VALUES (?, ?, ?, ?)",
 			id, name, id, time.Now().UTC().Format(time.RFC3339),
 		)
@@ -293,6 +342,25 @@ func runPrincipal() error {
 		}
 		fmt.Printf("Granted scope %s to %s\n", scope, principalID)
 
+	case "disable", "enable":
+		if len(os.Args) < 4 {
+			fmt.Fprintf(os.Stderr, "Usage: charon principal %s <principal-id>\n", sub)
+			os.Exit(1)
+		}
+		principalID := os.Args[3]
+		var disabledAt any
+		if sub == "disable" {
+			disabledAt = time.Now().UTC().Format(time.RFC3339)
+		}
+		result, err := db.ExecContext(ctx, "UPDATE principals SET disabled_at = ? WHERE id = ?", disabledAt, principalID)
+		if err != nil {
+			return err
+		}
+		if affected, _ := result.RowsAffected(); affected != 1 {
+			return fmt.Errorf("principal not found: %s", principalID)
+		}
+		fmt.Printf("Principal %s: %s\n", sub, principalID)
+
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown principal subcommand: %s\n", sub)
 		os.Exit(1)
@@ -320,21 +388,27 @@ func splitNonEmpty(value string) []string {
 
 func scopesForPermission(permission string) ([]string, error) {
 	readonly := []string{"memory.search", "memory.read", "thread.read"}
+	author := append(append([]string{}, readonly...),
+		"memory.branch", "memory.commit", "memory.propose")
 	switch permission {
 	case "readonly":
 		return readonly, nil
 	case "propose":
-		return append(readonly, "memory.propose"), nil
+		return author, nil
+	case "review":
+		return append(append([]string{}, readonly...),
+			"memory.review", "memory.merge", "proposal.review"), nil
 	case "write":
-		return append(readonly, "memory.propose", "memory.write", "proposal.review"), nil
+		return append(author,
+			"memory.review", "memory.merge", "memory.write", "proposal.review"), nil
 	default:
-		return nil, fmt.Errorf("unknown permission %q: expected readonly, propose, or write", permission)
+		return nil, fmt.Errorf("unknown permission %q: expected readonly, propose, review, or write", permission)
 	}
 }
 
 func runLedger() error {
 	if len(os.Args) < 3 {
-		fmt.Fprintln(os.Stderr, "Usage: charon ledger <tail>")
+		fmt.Fprintln(os.Stderr, "Usage: charon ledger <tail|verify>")
 		os.Exit(1)
 	}
 
@@ -356,9 +430,9 @@ func runLedger() error {
 
 	switch sub {
 	case "tail":
-		limit := 20
-		if len(os.Args) > 3 {
-			fmt.Sscanf(os.Args[3], "%d", &limit)
+		limit, err := optionalLimit(os.Args, 3, 20)
+		if err != nil {
+			return err
 		}
 		entries, err := ledgerSvc.Tail(ctx, limit)
 		if err != nil {
@@ -370,6 +444,12 @@ func runLedger() error {
 				e.Sequence, e.Operation, e.PrincipalID, e.Result, e.Latency.Milliseconds(),
 			)
 		}
+	case "verify":
+		count, err := ledgerSvc.Verify(ctx)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Ledger verified: %d entries\n", count)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown ledger subcommand: %s\n", sub)
 		os.Exit(1)
@@ -400,12 +480,15 @@ func runProposal() error {
 
 	letheClient := lethe.NewClient(cfg.Upstream, cfg.LetheAPIKey, cfg.RequestTimeout, int64(cfg.MaxResultBytes))
 	proposalSvc := proposal.NewService(db, letheClient)
+	if _, _, err := proposalSvc.MigrateStateDigests(ctx); err != nil {
+		return fmt.Errorf("proposal state digest migration: %w", err)
+	}
 
 	switch sub {
 	case "ls":
-		limit := 20
-		if len(os.Args) > 3 {
-			fmt.Sscanf(os.Args[3], "%d", &limit)
+		limit, err := optionalLimit(os.Args, 3, 20)
+		if err != nil {
+			return err
 		}
 		proposals, err := proposalSvc.List(ctx, proposal.StatusPending, limit)
 		if err != nil {
@@ -444,13 +527,26 @@ func runProposal() error {
 	return nil
 }
 
-func generateID() string {
+func generateID() (string, error) {
 	b := make([]byte, 8)
-	rand.Read(b)
-	return hex.EncodeToString(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate ID: %w", err)
+	}
+	return hex.EncodeToString(b), nil
 }
 
 // parseDuration parses a duration string like "7d", "1h", "30m"
+func optionalLimit(args []string, index, fallback int) (int, error) {
+	if len(args) <= index {
+		return fallback, nil
+	}
+	limit, err := strconv.Atoi(args[index])
+	if err != nil || limit <= 0 || limit > 100 {
+		return 0, fmt.Errorf("invalid limit %q: expected an integer from 1 to 100", args[index])
+	}
+	return limit, nil
+}
+
 func parseDuration(s string) (time.Duration, error) {
 	s = strings.TrimSpace(s)
 	if len(s) == 0 {

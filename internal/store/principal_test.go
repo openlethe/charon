@@ -4,6 +4,7 @@ import (
 	"context"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -33,6 +34,26 @@ func TestReconcilePrincipalCreatesAndReplacesGrants(t *testing.T) {
 
 	assertColumnValues(t, db, "SELECT project_id FROM principal_projects WHERE principal_id = ?", id, []string{"*"})
 	assertColumnValues(t, db, "SELECT scope FROM principal_scopes WHERE principal_id = ?", id, []string{"memory.read", "memory.search", "thread.read"})
+}
+
+func TestReconcilePrincipalRequiresExplicitEnable(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	id, _, err := db.ReconcilePrincipal(context.Background(), "disabled", []string{"project-1"}, []string{"memory.read"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("UPDATE principals SET disabled_at = '2026-07-15T00:00:00Z' WHERE id = ?", id); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.ReconcilePrincipal(context.Background(), "disabled", []string{"project-2"}, []string{"memory.write"}); err == nil || !strings.Contains(err.Error(), "enable it explicitly") {
+		t.Fatalf("expected disabled-principal error, got %v", err)
+	}
+	assertColumnValues(t, db, "SELECT project_id FROM principal_projects WHERE principal_id = ?", id, []string{"project-1"})
+	assertColumnValues(t, db, "SELECT scope FROM principal_scopes WHERE principal_id = ?", id, []string{"memory.read"})
 }
 
 func TestReconcilePrincipalRejectsAmbiguousName(t *testing.T) {

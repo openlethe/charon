@@ -77,6 +77,32 @@ func TestVerifyWrongAudience(t *testing.T) {
 	}
 }
 
+func TestMalformedStoredExpiryFailsClosed(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("INSERT INTO principals (id, name, created_at) VALUES (?, ?, ?)",
+		"p1", "test", time.Now().UTC().Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	svc := NewService(db, "test-hmac-key")
+	obol, err := svc.Mint(context.Background(), "p1", "https://charon.example.com", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("UPDATE obols SET expires_at = 'not-a-time' WHERE id = ?", obol.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Verify(context.Background(), obol.FullToken, "https://charon.example.com"); err == nil {
+		t.Fatal("malformed expiry was accepted")
+	}
+	if _, err := svc.List(context.Background(), "p1"); err == nil {
+		t.Fatal("malformed expiry was hidden from the operator")
+	}
+}
+
 func TestRevoke(t *testing.T) {
 	dir := t.TempDir()
 	db, err := store.Open(dir)
@@ -103,5 +129,43 @@ func TestRevoke(t *testing.T) {
 	_, err = svc.Verify(ctx, obol.FullToken, "https://charon.example.com")
 	if err == nil {
 		t.Error("expected error for revoked obol")
+	}
+}
+
+func TestMintThenListRoundtrip(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("INSERT INTO principals (id, name, created_at) VALUES (?, ?, ?)",
+		"p1", "test", time.Now().UTC().Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	svc := NewService(db, "test-hmac-key")
+	minted, err := svc.Mint(context.Background(), "p1", "https://charon.example.com", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	obols, err := svc.List(context.Background(), "p1")
+	if err != nil {
+		t.Fatalf("list freshly minted obol: %v", err)
+	}
+	if len(obols) != 1 {
+		t.Fatalf("listed %d obols, want 1", len(obols))
+	}
+	got := obols[0]
+	if got.ID != minted.ID {
+		t.Fatalf("listed id %s, want %s", got.ID, minted.ID)
+	}
+	if got.CreatedAt.IsZero() {
+		t.Fatal("listed CreatedAt is zero")
+	}
+	if !got.CreatedAt.Equal(minted.CreatedAt) {
+		t.Fatalf("CreatedAt = %v, want %v", got.CreatedAt, minted.CreatedAt)
+	}
+	if got.ExpiresAt == nil {
+		t.Fatal("listed ExpiresAt is nil")
 	}
 }

@@ -130,12 +130,6 @@ func isUniqueViolation(err error) bool {
 	return strings.Contains(err.Error(), "UNIQUE constraint failed")
 }
 
-func hashRequest(body interface{}) string {
-	data, _ := json.Marshal(body)
-	h := sha256.Sum256(data)
-	return hex.EncodeToString(h[:])
-}
-
 // Errors returned by idempotency checks.
 var (
 	ErrMismatchedKey = errors.New("idempotency key exists with different input")

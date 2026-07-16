@@ -2,6 +2,8 @@ package store
 
 import (
 	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -16,7 +18,7 @@ func TestOpen(t *testing.T) {
 	// Verify tables exist
 	tables := []string{
 		"principals", "principal_projects", "principal_scopes",
-		"obols", "idempotency_records", "ledger_entries", "schema_migrations",
+		"obols", "idempotency_records", "ledger_entries", "proposals", "schema_migrations",
 	}
 	for _, table := range tables {
 		var count int
@@ -27,6 +29,31 @@ func TestOpen(t *testing.T) {
 		}
 		if count != 1 {
 			t.Errorf("table %s not found", table)
+		}
+	}
+
+	var migrationCount int
+	if err := db.QueryRow("SELECT COUNT(*) FROM schema_migrations").Scan(&migrationCount); err != nil {
+		t.Fatal(err)
+	}
+	if migrationCount != 5 {
+		t.Fatalf("migration count = %d, want 5", migrationCount)
+	}
+
+	if runtime.GOOS != "windows" {
+		dirInfo, err := os.Stat(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dirInfo.Mode().Perm() != 0700 {
+			t.Fatalf("data dir mode = %o, want 700", dirInfo.Mode().Perm())
+		}
+		dbInfo, err := os.Stat(filepath.Join(dir, "charon.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dbInfo.Mode().Perm() != 0600 {
+			t.Fatalf("database mode = %o, want 600", dbInfo.Mode().Perm())
 		}
 	}
 }

@@ -1,0 +1,49 @@
+services:
+  charon-memory-git:
+    build: .
+    image: charon-memory-git-test:local
+    container_name: charon-memory-git-test
+    restart: unless-stopped
+    # Load shared upstream credentials directly from the same local-only file as
+    # Lethe Git. Keeping these two secrets out of `environment:` prevents an
+    # exported shell variable from silently overriding them during recreation.
+    env_file:
+      - path: ../lethe/.env.git
+        required: false
+    environment:
+      - CHARON_MODE=memory-git
+      - CHARON_HTTP=:18484
+      - CHARON_ADMIN_HTTP=/tmp/charon-admin.sock
+      - CHARON_UPSTREAM=http://host.docker.internal:18485
+      - CHARON_PUBLIC_URL=http://localhost:18487
+      - CHARON_DATA_DIR=/data
+      - CHARON_AUTH_MODE=obol
+    volumes:
+      - charon-memory-git-data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:18487:18484"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,uid=10001,gid=10001,mode=0700
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:18484/livez"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+# This stack is intentionally separate from docker-compose.yml:
+# - port 18484 + ./charon-data remain the existing Charon deployment
+# - port 18487 + the charon-memory-git-data named volume are reserved for isolated Memory Git testing
+# The service loads Lethe Git's ignored .env.git directly for the shared API/HMAC
+# credentials. `--env-file ../lethe/.env.git` may still be used for Compose-time
+# interpolation of public URL and OAuth settings.
+
+volumes:
+  charon-memory-git-data:

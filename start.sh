@@ -1,146 +1,90 @@
-#!/bin/bash
-# Charon Docker startup script for an existing canonical Lethe service.
+#!/usr/bin/env bash
+set -euo pipefail
 
-set -e
+# Start the hardened single-host Compose profile using externally provisioned
+# credentials. This script never creates or prints secret values.
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENV_FILE="${SCRIPT_DIR}/.env"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+env_file="${repo_root}/.env"
 
-# Create .env from example if it doesn't exist
-if [ ! -f "$ENV_FILE" ]; then
-    if [ -f "${ENV_FILE}.example" ]; then
-        cp "${ENV_FILE}.example" "$ENV_FILE"
-        echo "Created .env from .env.example"
-    fi
-fi
-
-# The environment file contains the Lethe API key and Charon signing key.
-if [ -f "$ENV_FILE" ]; then
-    chmod 600 "$ENV_FILE"
-fi
-
-# Load .env if present
-if [ -f "$ENV_FILE" ]; then
-    while IFS= read -r LINE || [ -n "$LINE" ]; do
-        LINE="${LINE%$'\r'}"
-        case "$LINE" in
-            ""|\#*) continue ;;
-        esac
-        KEY="${LINE%%=*}"
-        VALUE="${LINE#*=}"
-        if [[ "$KEY" =~ ^[A-Z_][A-Z0-9_]*$ ]]; then
-            if [[ "$VALUE" == \"*\" && "$VALUE" == *\" ]]; then
-                VALUE="${VALUE:1:${#VALUE}-2}"
-            elif [[ "$VALUE" == \'*\' && "$VALUE" == *\' ]]; then
-                VALUE="${VALUE:1:${#VALUE}-2}"
-            fi
-            printf -v "$KEY" '%s' "$VALUE"
-            export "$KEY"
-        fi
-    done < "$ENV_FILE"
-fi
-
-# Track if we generated anything
-GENERATED=0
-
-check_http_200() {
-    STATUS=$(curl --max-time 5 -sS -o /dev/null -w '%{http_code}' "$@") || return 1
-    [ "$STATUS" = "200" ]
-}
-
-# The upstream key must already match the canonical Lethe service. Generating
-# a replacement here would only break connectivity.
-if [ -z "$LETHE_API_KEY" ] || [ "$LETHE_API_KEY" == "change-me-in-production" ] || [ "$LETHE_API_KEY" == "replace-with-canonical-lethe-api-key" ]; then
-    echo "ERROR: set LETHE_API_KEY to the canonical Lethe API key in .env"
+if [[ ! -f "$env_file" ]]; then
+    echo "ERROR: ${env_file} is missing. Copy .env.example and provision the required values."
     exit 1
 fi
+chmod 600 "$env_file"
 
-# Auto-generate CHARON_HMAC_KEY if not set
-if [ -z "$CHARON_HMAC_KEY" ] || [ "$CHARON_HMAC_KEY" == "change-me-in-production" ] || [ "$CHARON_HMAC_KEY" == "replace-with-random-32-byte-key" ] || [ "$CHARON_HMAC_KEY" == "*** " ]; then
-    NEW_KEY=$(openssl rand -hex 32)
+set -a
+# shellcheck disable=SC1090
+source "$env_file"
+set +a
 
-    if [ -f "$ENV_FILE" ]; then
-        if grep -q "^CHARON_HMAC_KEY=" "$ENV_FILE"; then
-            if [[ "$OSTYPE" == "darwin"* ]]; then
-                sed -i '' "s/^CHARON_HMAC_KEY=.*/CHARON_HMAC_KEY=${NEW_KEY}/" "$ENV_FILE"
-            else
-                sed -i "s/^CHARON_HMAC_KEY=.*/CHARON_HMAC_KEY=${NEW_KEY}/" "$ENV_FILE"
-            fi
-        else
-            echo "CHARON_HMAC_KEY=${NEW_KEY}" >> "$ENV_FILE"
-        fi
-    else
-        echo "CHARON_HMAC_KEY=${NEW_KEY}" >> "$ENV_FILE"
-    fi
+charon_mode=${CHARON_MODE:-memory-git}
+obol_key=${CHARON_OBOL_HMAC_KEY:-${CHARON_HMAC_KEY:-}}
+oauth_key=${CHARON_OAUTH_HMAC_KEY:-${CHARON_HMAC_KEY:-}}
+merge_key=${CHARON_MERGE_HMAC_KEY:-${CHARON_HMAC_KEY:-}}
+pairing_secret=${CHARON_OAUTH_PAIRING_SECRET:-}
+generate_pairing_secret=${CHARON_OAUTH_GENERATE_PAIRING_SECRET:-true}
 
-    export CHARON_HMAC_KEY="$NEW_KEY"
-    GENERATED=1
-    echo "Generated CHARON_HMAC_KEY"
-fi
+[[ -n ${LETHE_API_KEY:-} ]] || { echo "ERROR: LETHE_API_KEY is required."; exit 1; }
+[[ "$LETHE_API_KEY" != *$'\n'* && "$LETHE_API_KEY" != *$'\r'* ]] || {
+    echo "ERROR: LETHE_API_KEY must not contain control characters."
+    exit 1
+}
+[[ -n ${CHARON_PUBLIC_URL:-} ]] || { echo "ERROR: CHARON_PUBLIC_URL is required."; exit 1; }
 
-if [ "$GENERATED" -eq 1 ]; then
-    echo ""
-    echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║  Auto-Generated Secrets                                      ║"
-    echo "╚══════════════════════════════════════════════════════════════╝"
-    echo ""
-    echo "Keys saved to .env — they will be reused on subsequent starts."
-    echo ""
-fi
-
-# Ensure Charon's policy database directory exists. Lethe owns its own storage.
-mkdir -p "${SCRIPT_DIR}/charon-data"
-
-# Verify the same canonical upstream Charon will use. The Docker-only host alias
-# maps back to localhost for this host-side preflight.
-UPSTREAM_FOR_HEALTH="${CHARON_UPSTREAM:-http://host.docker.internal:18483}"
-case "$UPSTREAM_FOR_HEALTH" in
-    http://host.docker.internal:*|https://host.docker.internal:*)
-        UPSTREAM_FOR_HEALTH=$(echo "$UPSTREAM_FOR_HEALTH" | sed 's|://host\.docker\.internal|://localhost|')
+[[ ${#obol_key} -ge 32 ]] || { echo "ERROR: provision CHARON_OBOL_HMAC_KEY for the reviewer gateway."; exit 1; }
+[[ ${#oauth_key} -ge 32 ]] || { echo "ERROR: provision CHARON_OAUTH_HMAC_KEY for the main gateway."; exit 1; }
+[[ -n ${CHARON_OAUTH_DEFAULT_USER:-} ]] || { echo "ERROR: CHARON_OAUTH_DEFAULT_USER is required."; exit 1; }
+[[ -n ${CHARON_OAUTH_REDIRECT_URIS:-} ]] || { echo "ERROR: CHARON_OAUTH_REDIRECT_URIS is required."; exit 1; }
+case "$generate_pairing_secret" in
+    1|[Tt]|[Tt][Rr][Uu][Ee]) ;;
+    0|[Ff]|[Ff][Aa][Ll][Ss][Ee])
+        [[ ${#pairing_secret} -ge 32 ]] || { echo "ERROR: provision CHARON_OAUTH_PAIRING_SECRET when generated pairing keys are disabled."; exit 1; }
+        ;;
+    *)
+        echo "ERROR: CHARON_OAUTH_GENERATE_PAIRING_SECRET must be true or false."
+        exit 1
         ;;
 esac
-LETHE_API="${LETHE_HEALTH_URL:-${UPSTREAM_FOR_HEALTH%/}/api/health}"
-if ! check_http_200 -H "Authorization: Bearer ${LETHE_API_KEY}" "$LETHE_API"; then
-    echo "ERROR: canonical Lethe is not healthy at $LETHE_API"
+
+if [[ "$charon_mode" == memory-git && ${#merge_key} -lt 32 ]]; then
+    echo "ERROR: provision CHARON_MERGE_HMAC_KEY and configure the same value on Lethe as CHARON_HMAC_KEY."
     exit 1
 fi
 
-echo "Starting Charon..."
+check_http_200() {
+    local status
+    status=$(curl --max-time 5 --silent --show-error --output /dev/null --write-out '%{http_code}' "$@") || return 1
+    [[ "$status" == 200 ]]
+}
+
+upstream=${CHARON_UPSTREAM:-http://host.docker.internal:18485}
+host_upstream=${upstream/host.docker.internal/127.0.0.1}
+lethe_health=${LETHE_HEALTH_URL:-${host_upstream%/}/api/health}
+lethe_header_file=$(mktemp)
+cleanup() {
+    rm -f "$lethe_header_file"
+}
+trap cleanup EXIT
+chmod 600 "$lethe_header_file"
+printf 'Authorization: Bearer %s\n' "$LETHE_API_KEY" > "$lethe_header_file"
+if ! check_http_200 --header "@${lethe_header_file}" "$lethe_health"; then
+    echo "ERROR: the configured Lethe upstream is not healthy."
+    exit 1
+fi
+
+cd "$repo_root"
 docker compose up -d --build
 
-# Verify health
-echo "Waiting for services to start..."
-for i in {1..30}; do
-    LETHE_OK=0
-    CHARON_OK=0
-
-    if check_http_200 -H "Authorization: Bearer ${LETHE_API_KEY}" "$LETHE_API" >/dev/null 2>&1; then
-        LETHE_OK=1
-    fi
-
-    if check_http_200 http://localhost:18484/health >/dev/null 2>&1; then
-        CHARON_OK=1
-    fi
-
-    if [ "$LETHE_OK" -eq 1 ] && [ "$CHARON_OK" -eq 1 ]; then
-        echo ""
-        echo "╔══════════════════════════════════════════════════════════════╗"
-        echo "║  Charon is connected to canonical Lethe                      ║"
-        echo "╚══════════════════════════════════════════════════════════════╝"
-        echo ""
-        echo "  Lethe API: $LETHE_API"
-        echo "  Charon:    http://localhost:18484/health"
-        echo "  MCP:       http://localhost:18484/mcp"
-        echo ""
-        if [ "${CHARON_AUTH_MODE:-obol}" == "oauth" ]; then
-            echo "  OAuth:     ${CHARON_PUBLIC_URL:-http://localhost:18484}/.well-known/oauth-protected-resource"
-        fi
-        echo ""
+for _ in {1..30}; do
+    if check_http_200 http://127.0.0.1:18484/readyz; then
+        echo "Charon is healthy at http://127.0.0.1:18484."
+        echo "OAuth metadata: ${CHARON_PUBLIC_URL%/}/.well-known/oauth-protected-resource"
         exit 0
     fi
-
     sleep 1
 done
 
-echo "WARNING: Health checks failed after 30s"
+echo "ERROR: Charon did not become healthy."
+docker compose ps
 exit 1

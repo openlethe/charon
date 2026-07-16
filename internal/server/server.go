@@ -5,11 +5,14 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/openlethe/charon/internal/auth"
 	"github.com/openlethe/charon/internal/config"
@@ -38,22 +41,35 @@ type Server struct {
 
 // NewServer creates a Charon server.
 func NewServer(cfg *config.Config, db *store.DB, logger *slog.Logger) (*Server, error) {
-	obolSvc := obol.NewService(db, cfg.HMACKey)
+	obolSvc := obol.NewService(db, cfg.ObolKey())
 	ledgerSvc := ledger.NewService(db)
 	letheClient := lethe.NewClient(cfg.Upstream, cfg.LetheAPIKey, cfg.RequestTimeout, int64(cfg.MaxResultBytes))
-	letheClient.SetMergeSigningKey(cfg.HMACKey)
+	letheClient.SetMergeSigningKey(cfg.MergeKey())
 	proposalSvc := proposal.NewService(db, letheClient)
+	migrated, quarantined, err := proposalSvc.MigrateStateDigests(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("proposal state digest migration: %w", err)
+	}
+	if migrated > 0 || quarantined > 0 {
+		logger.Info("proposal state digest migration complete",
+			"migrated", migrated, "quarantined", quarantined)
+	}
+	if quarantined > 0 {
+		logger.Warn("legacy proposals without verifiable state digest are quarantined and fail closed",
+			"quarantined", quarantined)
+	}
 	idempotencySvc := idempotency.NewService(db)
 	mcpServer := mcp.NewServer(cfg, letheClient, ledgerSvc, proposalSvc, idempotencySvc)
 
 	// Initialize OAuth service with HMAC key and client ID
 	var oauthSvc *oauth.Service
-	if cfg.HMACKey != "" {
+	if cfg.OAuthKey() != "" {
 		var err error
-		oauthSvc, err = oauth.NewService([]byte(cfg.HMACKey), cfg.PublicURL, cfg.OAuthClientID)
+		oauthSvc, err = oauth.NewService([]byte(cfg.OAuthKey()), cfg.PublicURL, cfg.OAuthClientID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize OAuth service: %w", err)
 		}
+		oauthSvc.SetAllowAuthorScopes(cfg.OAuthAllowAuthorScopes)
 	}
 
 	s := &Server{
@@ -104,40 +120,104 @@ func (s *Server) lookupPrincipalScopes(principalID string) ([]string, error) {
 	return scopes, nil
 }
 
-// Start begins serving HTTP.
-func (s *Server) Start() error {
+// Start serves the public and local-admin endpoints until the context is
+// cancelled or either listener fails. Both servers are shut down together.
+func (s *Server) Start(ctx context.Context) error {
 	publicHandler, err := s.Handler()
 	if err != nil {
 		return err
 	}
 
 	adminMux := http.NewServeMux()
-	adminMux.HandleFunc("/admin/health", s.handleHealth)
+	adminMux.HandleFunc("/admin/livez", s.handleLiveness)
+	adminMux.HandleFunc("/admin/readyz", s.handleReadiness)
+	adminMux.HandleFunc("/admin/health", s.handleReadiness)
 
-	go func() {
-		addr := s.cfg.AdminHTTP
-		if strings.HasPrefix(addr, "/") {
-			// Unix socket
-			listener, err := net.Listen("unix", addr)
-			if err != nil {
-				s.logger.Error("admin listener failed", "error", err)
-				return
+	publicListener, err := net.Listen("tcp", s.cfg.HTTP)
+	if err != nil {
+		return fmt.Errorf("public listener: %w", err)
+	}
+	adminNetwork := "tcp"
+	if strings.HasPrefix(s.cfg.AdminHTTP, "/") || strings.HasPrefix(s.cfg.AdminHTTP, "./") {
+		adminNetwork = "unix"
+		if err := prepareUnixSocket(s.cfg.AdminHTTP); err != nil {
+			prepareErr := fmt.Errorf("prepare admin socket: %w", err)
+			if closeErr := publicListener.Close(); closeErr != nil {
+				return errors.Join(prepareErr, fmt.Errorf("close public listener: %w", closeErr))
 			}
-			defer listener.Close()
-			s.logger.Info("admin listening", "socket", addr)
-			if err := http.Serve(listener, adminMux); err != nil {
-				s.logger.Error("admin server error", "error", err)
-			}
-		} else {
-			s.logger.Info("admin listening", "addr", addr)
-			if err := http.ListenAndServe(addr, adminMux); err != nil {
-				s.logger.Error("admin server error", "error", err)
-			}
+			return prepareErr
 		}
-	}()
+	}
+	adminListener, err := net.Listen(adminNetwork, s.cfg.AdminHTTP)
+	if err != nil {
+		listenErr := fmt.Errorf("admin listener: %w", err)
+		if closeErr := publicListener.Close(); closeErr != nil {
+			return errors.Join(listenErr, fmt.Errorf("close public listener: %w", closeErr))
+		}
+		return listenErr
+	}
 
-	s.logger.Info("charon listening", "addr", s.cfg.HTTP, "auth_mode", s.cfg.AuthMode)
-	return http.ListenAndServe(s.cfg.HTTP, publicHandler)
+	publicServer := &http.Server{
+		Handler:           publicHandler,
+		ReadHeaderTimeout: s.cfg.HTTPReadHeaderTimeout,
+		ReadTimeout:       s.cfg.HTTPReadTimeout,
+		IdleTimeout:       s.cfg.HTTPIdleTimeout,
+		MaxHeaderBytes:    s.cfg.HTTPMaxHeaderBytes,
+	}
+	adminServer := &http.Server{
+		Handler:           adminMux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    64 << 10,
+	}
+
+	errCh := make(chan error, 2)
+	go func() { errCh <- publicServer.Serve(publicListener) }()
+	go func() { errCh <- adminServer.Serve(adminListener) }()
+
+	s.logger.Info("charon listening", "addr", publicListener.Addr().String(), "auth_mode", s.cfg.AuthMode)
+	s.logger.Info("admin listening", "network", adminNetwork, "addr", s.cfg.AdminHTTP)
+
+	shutdown := func() error {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), s.cfg.HTTPShutdownTimeout)
+		defer cancel()
+		publicErr := publicServer.Shutdown(shutdownCtx)
+		adminErr := adminServer.Shutdown(shutdownCtx)
+		if publicErr != nil {
+			return fmt.Errorf("public shutdown: %w", publicErr)
+		}
+		if adminErr != nil {
+			return fmt.Errorf("admin shutdown: %w", adminErr)
+		}
+		return nil
+	}
+
+	select {
+	case <-ctx.Done():
+		return shutdown()
+	case serveErr := <-errCh:
+		_ = shutdown()
+		if errors.Is(serveErr, http.ErrServerClosed) {
+			return nil
+		}
+		return serveErr
+	}
+}
+
+func prepareUnixSocket(path string) error {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		return fmt.Errorf("refusing to replace non-socket path %q", path)
+	}
+	return os.Remove(path)
 }
 
 // Handler builds Charon's public HTTP surface. It is exposed so integration
@@ -157,23 +237,47 @@ func (s *Server) Handler() (http.Handler, error) {
 		}
 		mux.Handle("/mcp", s.withOAuthAuth(s.mcpServer))
 		// Register OAuth routes
-		oauthHandlers := oauth.NewHandlers(s.oauthSvc, s.oauthDefaultPrincipalID, s.cfg.OAuthRedirectURIs)
+		oauthHandlers := oauth.NewHandlers(
+			s.oauthSvc, s.oauthDefaultPrincipalID, s.cfg.OAuthRedirectURIs, s.cfg.OAuthPairingSecret,
+		)
 		oauthHandlers.RegisterRoutes(mux)
 		s.logger.Info("OAuth 2.0 endpoints registered")
 	default:
 		mux.Handle("/mcp", s.withObolAuth(s.mcpServer))
 	}
 
-	// Health check
-	mux.HandleFunc("/health", s.handleHealth)
-	return mux, nil
+	// Liveness is process-local; readiness includes the private Lethe upstream.
+	mux.HandleFunc("/livez", s.handleLiveness)
+	mux.HandleFunc("/readyz", s.handleReadiness)
+	mux.HandleFunc("/health", s.handleReadiness)
+	return limitRequestBody(mux, s.cfg.MaxRequestBytes), nil
+}
+
+func limitRequestBody(next http.Handler, maxBytes int64) http.Handler {
+	if maxBytes <= 0 {
+		maxBytes = 1 << 20
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ContentLength > maxBytes {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // withObolAuth validates Obol tokens (legacy, default).
 func (s *Server) withObolAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		reqID := generateRequestID()
-		r = r.WithContext(context.WithValue(r.Context(), "request_id", reqID))
+		reqID, err := generateRequestID()
+		if err != nil {
+			s.logger.Error("request ID generation failed", "error", err)
+			http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+			return
+		}
 
 		// Extract bearer token
 		authHeader := r.Header.Get("Authorization")
@@ -215,8 +319,12 @@ func (s *Server) withObolAuth(next http.Handler) http.Handler {
 // withOAuthAuth validates OAuth 2.0 access tokens.
 func (s *Server) withOAuthAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		reqID := generateRequestID()
-		r = r.WithContext(context.WithValue(r.Context(), "request_id", reqID))
+		reqID, err := generateRequestID()
+		if err != nil {
+			s.logger.Error("request ID generation failed", "error", err)
+			http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+			return
+		}
 
 		// Allow CORS preflight requests
 		if r.Method == http.MethodOptions {
@@ -324,7 +432,7 @@ func (s *Server) loadPrincipalByIDOrName(ctx context.Context, idOrName string) (
 
 	// Fallback: check name uniqueness before resolving
 	var count int
-	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM principals WHERE name = ?", idOrName).Scan(&count); err != nil {
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM principals WHERE name = ? AND disabled_at IS NULL", idOrName).Scan(&count); err != nil {
 		return auth.Principal{}, fmt.Errorf("count principals by name: %w", err)
 	}
 	if count == 0 {
@@ -337,7 +445,7 @@ func (s *Server) loadPrincipalByIDOrName(ctx context.Context, idOrName string) (
 	// Exactly one match — load by name
 	var p2 auth.Principal
 	var agentID sql.NullString
-	row := s.db.QueryRowContext(ctx, "SELECT id, name, agent_id FROM principals WHERE name = ?", idOrName)
+	row := s.db.QueryRowContext(ctx, "SELECT id, name, agent_id FROM principals WHERE name = ? AND disabled_at IS NULL", idOrName)
 	if err := row.Scan(&p2.ID, &p2.Name, &agentID); err != nil {
 		return p2, fmt.Errorf("load principal by name: %w", err)
 	}
@@ -386,7 +494,7 @@ func (s *Server) loadPrincipalByIDOrName(ctx context.Context, idOrName string) (
 func (s *Server) loadPrincipal(ctx context.Context, id string) (auth.Principal, error) {
 	var p auth.Principal
 	var agentID sql.NullString
-	row := s.db.QueryRowContext(ctx, "SELECT id, name, agent_id FROM principals WHERE id = ?", id)
+	row := s.db.QueryRowContext(ctx, "SELECT id, name, agent_id FROM principals WHERE id = ? AND disabled_at IS NULL", id)
 	if err := row.Scan(&p.ID, &p.Name, &agentID); err != nil {
 		return p, fmt.Errorf("load principal: %w", err)
 	}
@@ -432,16 +540,22 @@ func (s *Server) loadPrincipal(ctx context.Context, id string) (auth.Principal, 
 	return p, nil
 }
 
-func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleLiveness(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"status":"alive"}`))
+}
+
+func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := s.lethe.Health(r.Context()); err != nil {
-		s.logger.Warn("upstream Lethe health check failed", "error", sanitizeHealthError(err))
+		s.logger.Warn("upstream Lethe readiness check failed", "error", sanitizeHealthError(err))
 		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write([]byte(`{"status":"unavailable"}`))
+		_, _ = w.Write([]byte(`{"status":"unavailable"}`))
 		return
 	}
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"status":"ok"}`))
+	_, _ = w.Write([]byte(`{"status":"ready"}`))
 }
 
 func scopeSet(scopes []string) map[string]struct{} {
@@ -472,8 +586,10 @@ func sanitizeHealthError(err error) string {
 	return err.Error()
 }
 
-func generateRequestID() string {
+func generateRequestID() (string, error) {
 	b := make([]byte, 8)
-	rand.Read(b)
-	return hex.EncodeToString(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate request ID: %w", err)
+	}
+	return hex.EncodeToString(b), nil
 }

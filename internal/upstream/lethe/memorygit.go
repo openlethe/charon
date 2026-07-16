@@ -2,7 +2,6 @@ package lethe
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -120,6 +119,7 @@ type Conflict struct {
 	Summary          string                 `json:"summary"`
 	Details          map[string]interface{} `json:"details,omitempty"`
 	Status           string                 `json:"status"`
+	ProposalID       string                 `json:"proposal_id,omitempty"`
 }
 
 type DiffRequest struct {
@@ -161,6 +161,38 @@ type DiffKindNote struct {
 	Reason       string `json:"reason"`
 }
 
+type AcceptedMemory struct {
+	MemoryID  string   `json:"memory_id"`
+	Content   string   `json:"content"`
+	EventType string   `json:"event_type,omitempty"`
+	Kind      string   `json:"kind,omitempty"`
+	Scope     string   `json:"scope,omitempty"`
+	Tags      []string `json:"tags,omitempty"`
+	Status    string   `json:"status"`
+	Source    string   `json:"source"`
+}
+
+type MemoryContextRequest struct {
+	RefName         string `json:"ref_name,omitempty"`
+	HeadChangesetID string `json:"head_changeset_id,omitempty"`
+	Query           string `json:"query,omitempty"`
+	Limit           int    `json:"limit,omitempty"`
+	SessionID       string `json:"session_id,omitempty"`
+	ActorID         string `json:"actor_id,omitempty"`
+	CreateManifest  bool   `json:"create_manifest,omitempty"`
+}
+
+type MemoryContextResponse struct {
+	ProjectID           string           `json:"project_id"`
+	RefName             string           `json:"ref_name"`
+	HeadChangesetID     string           `json:"head_changeset_id"`
+	ManifestID          string           `json:"manifest_id,omitempty"`
+	ProjectionVersion   string           `json:"projection_version"`
+	TotalActive         int              `json:"total_active"`
+	Memories            []AcceptedMemory `json:"memories"`
+	UnresolvedConflicts []string         `json:"unresolved_conflicts,omitempty"`
+}
+
 type Manifest struct {
 	ManifestID           string            `json:"manifest_id"`
 	Direction            string            `json:"direction"`
@@ -182,7 +214,7 @@ type Manifest struct {
 
 // EnsureLegacyRoot ensures the project has a legacy root changeset and refs/shared/main.
 func (c *Client) EnsureLegacyRoot(ctx context.Context, projectID string) (*LegacyRootResponse, error) {
-	resp, err := c.doRequest(ctx, http.MethodPost, fmt.Sprintf("/api/memory/%s/legacy-root", projectID), nil)
+	resp, err := c.doRequest(ctx, http.MethodPost, fmt.Sprintf("/api/memory/%s/legacy-root", url.PathEscape(projectID)), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -216,7 +248,7 @@ func (c *Client) CreateChangeset(ctx context.Context, req CreateChangesetRequest
 
 // GetChangeset loads a changeset by ID.
 func (c *Client) GetChangeset(ctx context.Context, id string) (*Changeset, error) {
-	resp, err := c.doRequest(ctx, http.MethodGet, fmt.Sprintf("/api/memory/changesets/%s", id), nil)
+	resp, err := c.doRequest(ctx, http.MethodGet, fmt.Sprintf("/api/memory/changesets/%s", url.PathEscape(id)), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -253,7 +285,7 @@ func (c *Client) ListChangesets(ctx context.Context, projectID, refName string, 
 
 // CreateBranch creates a new memory ref.
 func (c *Client) CreateBranch(ctx context.Context, projectID string, req CreateBranchRequest) (*Ref, error) {
-	resp, err := c.doRequest(ctx, http.MethodPost, fmt.Sprintf("/api/memory/%s/branches", projectID), req)
+	resp, err := c.doRequest(ctx, http.MethodPost, fmt.Sprintf("/api/memory/%s/branches", url.PathEscape(projectID)), req)
 	if err != nil {
 		return nil, err
 	}
@@ -284,7 +316,7 @@ func (c *Client) GetRef(ctx context.Context, projectID, refName string) (*Ref, e
 
 // ListRefs returns all refs for a project.
 func (c *Client) ListRefs(ctx context.Context, projectID string) ([]Ref, error) {
-	resp, err := c.doRequest(ctx, http.MethodGet, fmt.Sprintf("/api/memory/%s/refs", projectID), nil)
+	resp, err := c.doRequest(ctx, http.MethodGet, fmt.Sprintf("/api/memory/%s/refs", url.PathEscape(projectID)), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -340,7 +372,9 @@ func (c *Client) MergeAdvanceRef(ctx context.Context, projectID, refName string,
 	return &ref, nil
 }
 
-// DetectConflicts asks Lethe to compute and persist explicit merge conflicts.
+// DetectConflicts asks Lethe to compute conflicts. Detection is pure: nothing
+// is persisted until PersistConflicts runs as part of an explicit proposal
+// operation.
 func (c *Client) DetectConflicts(ctx context.Context, projectID string, req DetectConflictsRequest) ([]Conflict, error) {
 	resp, err := c.doRequest(ctx, http.MethodPost, fmt.Sprintf("/api/memory/%s/conflicts/detect", url.PathEscape(projectID)), req)
 	if err != nil {
@@ -359,9 +393,40 @@ func (c *Client) DetectConflicts(ctx context.Context, projectID string, req Dete
 	return result.Conflicts, nil
 }
 
+// PersistConflicts binds a detected conflict set to its proposal. Idempotent:
+// conflict identity is deterministic, so retries and replays converge on the
+// same rows instead of duplicating them.
+func (c *Client) PersistConflicts(ctx context.Context, projectID, proposalID string, conflicts []Conflict) error {
+	body := map[string]any{"proposal_id": proposalID, "conflicts": conflicts}
+	resp, err := c.doRequest(ctx, http.MethodPost, fmt.Sprintf("/api/memory/%s/conflicts/persist", url.PathEscape(projectID)), body)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("lethe returned %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// RetireConflicts retires every open conflict bound to a proposal that reached
+// a terminal state (rejected, canceled) or whose merge landed (superseded).
+func (c *Client) RetireConflicts(ctx context.Context, projectID, proposalID, status string) error {
+	body := map[string]any{"proposal_id": proposalID, "status": status}
+	resp, err := c.doRequest(ctx, http.MethodPost, fmt.Sprintf("/api/memory/%s/conflicts/retire", url.PathEscape(projectID)), body)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("lethe returned %d", resp.StatusCode)
+	}
+	return nil
+}
+
 // DiffChangeset computes a semantic diff.
 func (c *Client) DiffChangeset(ctx context.Context, changesetID string, req DiffRequest) (*DiffResponse, error) {
-	resp, err := c.doRequest(ctx, http.MethodPost, fmt.Sprintf("/api/memory/changesets/%s/diff", changesetID), req)
+	resp, err := c.doRequest(ctx, http.MethodPost, fmt.Sprintf("/api/memory/changesets/%s/diff", url.PathEscape(changesetID)), req)
 	if err != nil {
 		return nil, err
 	}
@@ -370,8 +435,27 @@ func (c *Client) DiffChangeset(ctx context.Context, changesetID string, req Diff
 		return nil, fmt.Errorf("lethe returned %d", resp.StatusCode)
 	}
 	var result DiffResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := c.decodeJSON(resp, &result); err != nil {
 		return nil, fmt.Errorf("decode diff: %w", err)
+	}
+	return &result, nil
+}
+
+// GetMemoryContext reconstructs semantic memory at an exact ref/head and can
+// persist an input manifest for the selected IDs.
+func (c *Client) GetMemoryContext(ctx context.Context, projectID string, req MemoryContextRequest) (*MemoryContextResponse, error) {
+	resp, err := c.doRequest(ctx, http.MethodPost,
+		fmt.Sprintf("/api/memory/%s/context", url.PathEscape(projectID)), req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("lethe returned %d", resp.StatusCode)
+	}
+	var result MemoryContextResponse
+	if err := c.decodeJSON(resp, &result); err != nil {
+		return nil, fmt.Errorf("decode memory context: %w", err)
 	}
 	return &result, nil
 }
@@ -387,7 +471,7 @@ func (c *Client) CreateManifest(ctx context.Context, m Manifest) (*Manifest, err
 		return nil, fmt.Errorf("lethe returned %d", resp.StatusCode)
 	}
 	var result Manifest
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := c.decodeJSON(resp, &result); err != nil {
 		return nil, fmt.Errorf("decode manifest: %w", err)
 	}
 	return &result, nil
@@ -395,7 +479,7 @@ func (c *Client) CreateManifest(ctx context.Context, m Manifest) (*Manifest, err
 
 // GetManifest loads a manifest by ID.
 func (c *Client) GetManifest(ctx context.Context, id string) (*Manifest, error) {
-	resp, err := c.doRequest(ctx, http.MethodGet, fmt.Sprintf("/api/memory/manifests/%s", id), nil)
+	resp, err := c.doRequest(ctx, http.MethodGet, fmt.Sprintf("/api/memory/manifests/%s", url.PathEscape(id)), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -407,7 +491,7 @@ func (c *Client) GetManifest(ctx context.Context, id string) (*Manifest, error) 
 		return nil, fmt.Errorf("lethe returned %d", resp.StatusCode)
 	}
 	var m Manifest
-	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+	if err := c.decodeJSON(resp, &m); err != nil {
 		return nil, fmt.Errorf("decode manifest: %w", err)
 	}
 	return &m, nil

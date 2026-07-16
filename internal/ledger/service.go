@@ -1,10 +1,13 @@
 package ledger
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/openlethe/charon/internal/store"
@@ -24,9 +27,12 @@ type Entry struct {
 	EntryHash    []byte
 }
 
-// Service manages ledger entries.
+// Service manages ledger entries. The mutex avoids needless lock contention
+// within one process; BEGIN IMMEDIATE serializes the hash-chain read and append
+// across every Charon process using the same SQLite database.
 type Service struct {
 	db *store.DB
+	mu sync.Mutex
 }
 
 // NewService creates a ledger service.
@@ -34,31 +40,44 @@ func NewService(db *store.DB) *Service {
 	return &Service{db: db}
 }
 
-// Record creates a new ledger entry with hash chaining.
+// Record creates a new ledger entry with a serialized, transactional hash link.
 func (s *Service) Record(ctx context.Context, entry Entry) error {
-	now := time.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	// Fetch previous hash
-	var prevHash []byte
-	row := s.db.QueryRowContext(ctx, "SELECT entry_hash FROM ledger_entries ORDER BY sequence DESC LIMIT 1")
-	_ = row.Scan(&prevHash) // Ignore error for first entry
-
-	// Build entry hash from metadata only (no content)
-	h := sha256.New()
-	h.Write([]byte(entry.RequestID))
-	h.Write([]byte(entry.PrincipalID))
-	h.Write([]byte(entry.Operation))
-	projJSON, _ := json.Marshal(entry.Projects)
-	h.Write(projJSON)
-	h.Write([]byte(entry.Result))
-	h.Write([]byte(fmt.Sprintf("%d", entry.Latency.Milliseconds())))
-	h.Write([]byte(now.Format(time.RFC3339Nano)))
-	if prevHash != nil {
-		h.Write(prevHash)
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire ledger connection: %w", err)
 	}
-	entryHash := h.Sum(nil)
+	defer conn.Close()
 
-	_, err := s.db.ExecContext(ctx, `
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return fmt.Errorf("begin ledger append: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		}
+	}()
+
+	var prevHash []byte
+	err = conn.QueryRowContext(ctx, "SELECT entry_hash FROM ledger_entries ORDER BY sequence DESC LIMIT 1").Scan(&prevHash)
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("load previous ledger hash: %w", err)
+	}
+	if err == sql.ErrNoRows {
+		prevHash = nil
+	}
+
+	now := time.Now().UTC()
+	projectsJSON, err := json.Marshal(entry.Projects)
+	if err != nil {
+		return fmt.Errorf("marshal ledger projects: %w", err)
+	}
+	entryHash := digestEntry(entry, now, projectsJSON, prevHash)
+
+	_, err = conn.ExecContext(ctx, `
 		INSERT INTO ledger_entries (
 			created_at, request_id, principal_id, operation,
 			authorized_projects_json, result, latency_ms,
@@ -69,7 +88,7 @@ func (s *Service) Record(ctx context.Context, entry Entry) error {
 		entry.RequestID,
 		entry.PrincipalID,
 		entry.Operation,
-		string(projJSON),
+		string(projectsJSON),
 		entry.Result,
 		entry.Latency.Milliseconds(),
 		prevHash,
@@ -78,7 +97,99 @@ func (s *Service) Record(ctx context.Context, entry Entry) error {
 	if err != nil {
 		return fmt.Errorf("insert ledger: %w", err)
 	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return fmt.Errorf("commit ledger append: %w", err)
+	}
+	committed = true
 	return nil
+}
+
+func digestEntry(entry Entry, createdAt time.Time, projectsJSON, previousHash []byte) []byte {
+	payload, _ := json.Marshal(struct {
+		RequestID    string `json:"request_id"`
+		PrincipalID  string `json:"principal_id"`
+		Operation    string `json:"operation"`
+		ProjectsJSON []byte `json:"projects_json"`
+		Result       string `json:"result"`
+		LatencyMS    int64  `json:"latency_ms"`
+		CreatedAt    string `json:"created_at"`
+		PreviousHash []byte `json:"previous_hash"`
+	}{
+		RequestID:    entry.RequestID,
+		PrincipalID:  entry.PrincipalID,
+		Operation:    entry.Operation,
+		ProjectsJSON: projectsJSON,
+		Result:       entry.Result,
+		LatencyMS:    entry.Latency.Milliseconds(),
+		CreatedAt:    createdAt.UTC().Format(time.RFC3339Nano),
+		PreviousHash: previousHash,
+	})
+	digest := sha256.Sum256(payload)
+	return digest[:]
+}
+
+// legacyDigestEntry preserves verification for ledger rows written before the
+// structured framing format was introduced. New rows always use digestEntry.
+func legacyDigestEntry(entry Entry, createdAt time.Time, projectsJSON, previousHash []byte) []byte {
+	h := sha256.New()
+	h.Write([]byte(entry.RequestID))
+	h.Write([]byte(entry.PrincipalID))
+	h.Write([]byte(entry.Operation))
+	h.Write(projectsJSON)
+	h.Write([]byte(entry.Result))
+	h.Write([]byte(fmt.Sprintf("%d", entry.Latency.Milliseconds())))
+	h.Write([]byte(createdAt.UTC().Format(time.RFC3339Nano)))
+	h.Write(previousHash)
+	return h.Sum(nil)
+}
+
+// Verify checks every stored hash and predecessor link in sequence order.
+func (s *Service) Verify(ctx context.Context) (int64, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT sequence, created_at, request_id, principal_id, operation,
+			authorized_projects_json, result, latency_ms, previous_hash, entry_hash
+		FROM ledger_entries
+		ORDER BY sequence ASC
+	`)
+	if err != nil {
+		return 0, fmt.Errorf("query ledger for verification: %w", err)
+	}
+	defer rows.Close()
+
+	var count int64
+	var previous []byte
+	for rows.Next() {
+		var entry Entry
+		var createdAt string
+		var projectsJSON []byte
+		var latencyMS int64
+		if err := rows.Scan(
+			&entry.Sequence, &createdAt, &entry.RequestID, &entry.PrincipalID,
+			&entry.Operation, &projectsJSON, &entry.Result, &latencyMS,
+			&entry.PreviousHash, &entry.EntryHash,
+		); err != nil {
+			return count, fmt.Errorf("scan ledger sequence: %w", err)
+		}
+		parsedTime, err := time.Parse(time.RFC3339Nano, createdAt)
+		if err != nil {
+			return count, fmt.Errorf("ledger sequence %d has invalid timestamp: %w", entry.Sequence, err)
+		}
+		if !bytes.Equal(entry.PreviousHash, previous) {
+			return count, fmt.Errorf("ledger sequence %d has an invalid predecessor", entry.Sequence)
+		}
+		entry.Latency = time.Duration(latencyMS) * time.Millisecond
+		expected := digestEntry(entry, parsedTime, projectsJSON, previous)
+		legacyExpected := legacyDigestEntry(entry, parsedTime, projectsJSON, previous)
+		if !bytes.Equal(entry.EntryHash, expected) && !bytes.Equal(entry.EntryHash, legacyExpected) {
+			return count, fmt.Errorf("ledger sequence %d has an invalid entry hash", entry.Sequence)
+		}
+		previous = append([]byte(nil), entry.EntryHash...)
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		return count, fmt.Errorf("iterate ledger verification: %w", err)
+	}
+	return count, nil
 }
 
 // Tail returns the most recent ledger entries.
@@ -104,24 +215,21 @@ func (s *Service) Tail(ctx context.Context, limit int) ([]Entry, error) {
 
 	var entries []Entry
 	for rows.Next() {
-		var e Entry
+		var entry Entry
 		var createdAt string
-		var projJSON string
-		var latencyMs int64
-
+		var projectsJSON string
+		var latencyMS int64
 		if err := rows.Scan(
-			&e.Sequence, &createdAt, &e.RequestID, &e.PrincipalID,
-			&e.Operation, &projJSON, &e.Result, &latencyMs,
-			&e.PreviousHash, &e.EntryHash,
+			&entry.Sequence, &createdAt, &entry.RequestID, &entry.PrincipalID,
+			&entry.Operation, &projectsJSON, &entry.Result, &latencyMS,
+			&entry.PreviousHash, &entry.EntryHash,
 		); err != nil {
 			return nil, fmt.Errorf("scan ledger: %w", err)
 		}
-
-		e.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
-		e.Latency = time.Duration(latencyMs) * time.Millisecond
-		json.Unmarshal([]byte(projJSON), &e.Projects)
-		entries = append(entries, e)
+		entry.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+		entry.Latency = time.Duration(latencyMS) * time.Millisecond
+		_ = json.Unmarshal([]byte(projectsJSON), &entry.Projects)
+		entries = append(entries, entry)
 	}
-
 	return entries, rows.Err()
 }

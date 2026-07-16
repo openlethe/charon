@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -19,11 +20,26 @@ type DB struct {
 
 // Open initializes the SQLite database with migrations.
 func Open(dataDir string) (*DB, error) {
-	if err := os.MkdirAll(dataDir, 0750); err != nil {
+	if err := os.MkdirAll(dataDir, 0700); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
+	}
+	// #nosec G302 -- directories require execute permission; 0700 is owner-only.
+	if err := os.Chmod(dataDir, 0700); err != nil {
+		return nil, fmt.Errorf("secure data dir: %w", err)
 	}
 
 	dbPath := filepath.Join(dataDir, "charon.db")
+	// #nosec G304 -- CHARON_DATA_DIR is an explicit operator-controlled storage root.
+	dbFile, err := os.OpenFile(dbPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("create sqlite file: %w", err)
+	}
+	if err := dbFile.Close(); err != nil {
+		return nil, fmt.Errorf("close sqlite file: %w", err)
+	}
+	if err := os.Chmod(dbPath, 0600); err != nil {
+		return nil, fmt.Errorf("secure sqlite file: %w", err)
+	}
 	dsn := fmt.Sprintf("%s?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)", dbPath)
 
 	sqlDB, err := sql.Open("sqlite", dsn)
@@ -33,8 +49,11 @@ func Open(dataDir string) (*DB, error) {
 
 	db := &DB{DB: sqlDB, dataDir: dataDir}
 	if err := db.migrate(); err != nil {
-		sqlDB.Close()
-		return nil, fmt.Errorf("migrate: %w", err)
+		migrationErr := fmt.Errorf("migrate: %w", err)
+		if closeErr := sqlDB.Close(); closeErr != nil {
+			return nil, errors.Join(migrationErr, fmt.Errorf("close failed store: %w", closeErr))
+		}
+		return nil, migrationErr
 	}
 
 	return db, nil
@@ -63,22 +82,10 @@ func (db *DB) migrate() error {
 		if err := db.migrateV1(); err != nil {
 			return err
 		}
-		if _, err := db.ExecContext(ctx,
-			"INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-			1, time.Now().UTC().Format(time.RFC3339),
-		); err != nil {
-			return err
-		}
 	}
 
 	if currentVersion < 2 {
 		if err := db.migrateV2(); err != nil {
-			return err
-		}
-		if _, err := db.ExecContext(ctx,
-			"INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-			2, time.Now().UTC().Format(time.RFC3339),
-		); err != nil {
 			return err
 		}
 	}
@@ -87,22 +94,16 @@ func (db *DB) migrate() error {
 		if err := db.migrateV3(); err != nil {
 			return err
 		}
-		if _, err := db.ExecContext(ctx,
-			"INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-			3, time.Now().UTC().Format(time.RFC3339),
-		); err != nil {
-			return err
-		}
 	}
 
 	if currentVersion < 4 {
 		if err := db.migrateV4(); err != nil {
 			return err
 		}
-		if _, err := db.ExecContext(ctx,
-			"INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-			4, time.Now().UTC().Format(time.RFC3339),
-		); err != nil {
+	}
+
+	if currentVersion < 5 {
+		if err := db.migrateV5(); err != nil {
 			return err
 		}
 	}
@@ -177,7 +178,9 @@ func (db *DB) migrateV1() error {
 			return fmt.Errorf("migration v1: %w", err)
 		}
 	}
-
+	if err := recordMigration(ctx, tx, 1); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -222,7 +225,9 @@ func (db *DB) migrateV2() error {
 			return fmt.Errorf("migration v2: %w", err)
 		}
 	}
-
+	if err := recordMigration(ctx, tx, 2); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -245,7 +250,9 @@ func (db *DB) migrateV3() error {
 			return fmt.Errorf("migration v3: %w", err)
 		}
 	}
-
+	if err := recordMigration(ctx, tx, 3); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -277,5 +284,53 @@ func (db *DB) migrateV4() error {
 			return fmt.Errorf("migration v4: %w", err)
 		}
 	}
+	if err := recordMigration(ctx, tx, 4); err != nil {
+		return err
+	}
 	return tx.Commit()
+}
+
+// migrateV5 binds every proposal to the canonical request that created it and
+// to a recomputed state integrity digest. request_digest makes merge-proposal
+// creation exactly-once: an idempotent replay is matched against the canonical
+// request, and a same-key different-request replay fails closed. state_digest
+// is verified on every load so a corrupted or tampered persisted proposal can
+// never be normalized into a weaker one (for example widening a selected-ops
+// partial merge into a full merge). The digest backfill for pre-v5 rows runs
+// as a Go data migration (proposal.BackfillStateDigests) because it requires
+// the canonical digest algorithm; rows whose persisted JSON does not decode
+// keep a NULL digest and are quarantined fail-closed on load.
+func (db *DB) migrateV5() error {
+	ctx := context.Background()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	statements := []string{
+		`ALTER TABLE proposals ADD COLUMN request_digest TEXT`,
+		`ALTER TABLE proposals ADD COLUMN state_digest TEXT`,
+		`CREATE INDEX idx_proposals_request_digest ON proposals(request_digest)`,
+	}
+
+	for _, stmt := range statements {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("migration v5: %w", err)
+		}
+	}
+	if err := recordMigration(ctx, tx, 5); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func recordMigration(ctx context.Context, tx *sql.Tx, version int) error {
+	if _, err := tx.ExecContext(ctx,
+		"INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+		version, time.Now().UTC().Format(time.RFC3339),
+	); err != nil {
+		return fmt.Errorf("record migration v%d: %w", version, err)
+	}
+	return nil
 }
