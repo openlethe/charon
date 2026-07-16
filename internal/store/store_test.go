@@ -36,8 +36,8 @@ func TestOpen(t *testing.T) {
 	if err := db.QueryRow("SELECT COUNT(*) FROM schema_migrations").Scan(&migrationCount); err != nil {
 		t.Fatal(err)
 	}
-	if migrationCount != 5 {
-		t.Fatalf("migration count = %d, want 5", migrationCount)
+	if migrationCount != 6 {
+		t.Fatalf("migration count = %d, want 6", migrationCount)
 	}
 
 	if runtime.GOOS != "windows" {

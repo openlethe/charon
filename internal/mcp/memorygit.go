@@ -10,6 +10,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/openlethe/charon/internal/auth"
+	"github.com/openlethe/charon/internal/canonical"
 	"github.com/openlethe/charon/internal/policy"
 	"github.com/openlethe/charon/internal/proposal"
 	"github.com/openlethe/charon/internal/upstream/lethe"
@@ -129,11 +130,19 @@ func (s *Server) handleMemoryRepoInit(ctx context.Context, request mcp.CallToolR
 		s.recordLedger(reqID, principal, "memory_repo_init", nil, "denied: project access", time.Since(start))
 		return nil, fmt.Errorf("unauthorized: %w", err)
 	}
+	intent, err := s.beginAuditIntent(ctx, principal, "memory_repo_init", project,
+		canonical.MustDigest("charon/audit-request/v1", map[string]string{"project": project}),
+		project+":refs/shared/main", "ensure legacy root and protected ref")
+	if err != nil {
+		return nil, err
+	}
 	root, err := s.lethe.EnsureLegacyRoot(ctx, project)
 	if err != nil {
+		s.finishAudit(intent, err)
 		s.recordLedger(reqID, principal, "memory_repo_init", []string{project}, "error: "+sanitizeError(err), time.Since(start))
 		return nil, fmt.Errorf("repository initialization failed: %w", err)
 	}
+	s.finishAudit(intent, nil)
 	data, _ := json.MarshalIndent(root, "", "  ")
 	s.recordLedger(reqID, principal, "memory_repo_init", []string{project}, "success", time.Since(start))
 	return mcp.NewToolResultText(string(data)), nil
@@ -247,15 +256,23 @@ func (s *Server) handleMemoryBranchCreate(ctx context.Context, request mcp.CallT
 	if err != nil || head.ProjectID != project {
 		return nil, fmt.Errorf("branch head does not belong to project %s", project)
 	}
+	intent, err := s.beginAuditIntent(ctx, principal, "memory_branch_create", project,
+		canonical.MustDigest("charon/audit-request/v1", map[string]string{"project": project, "ref_name": refName, "head_changeset_id": headID}),
+		project+":"+refName, "create ref at "+headID)
+	if err != nil {
+		return nil, err
+	}
 	ref, err := s.lethe.CreateBranch(ctx, project, lethe.CreateBranchRequest{
 		RefName:         refName,
 		HeadChangesetID: headID,
 		Principal:       principal.ID,
 	})
 	if err != nil {
+		s.finishAudit(intent, err)
 		s.recordLedger(reqID, principal, "memory_branch_create", []string{project}, "error: "+sanitizeError(err), time.Since(start))
 		return nil, fmt.Errorf("branch create failed: %w", err)
 	}
+	s.finishAudit(intent, nil)
 	data, _ := json.MarshalIndent(ref, "", "  ")
 	s.recordLedger(reqID, principal, "memory_branch_create", []string{project}, "success", time.Since(start))
 	return mcp.NewToolResultText(string(data)), nil
@@ -406,12 +423,21 @@ func (s *Server) handleMemoryChangesetCreate(ctx context.Context, request mcp.Ca
 		return s.changesetResultFromID(ctx, existing.ResultingResourceID)
 	}
 
+	intent, err := s.beginAuditIntent(ctx, principal, "memory_changeset_create", project,
+		canonical.MustDigest("charon/audit-request/v1", typed),
+		project+":"+refName, "commit changeset and advance ref")
+	if err != nil {
+		return nil, err
+	}
+
 	expectedHead := typed.ExpectedHead
 	ref, err := s.lethe.GetRef(ctx, project, refName)
 	if err != nil {
+		s.finishAudit(intent, err)
 		return nil, fmt.Errorf("load ref: %w", err)
 	}
 	if ref == nil {
+		s.finishAudit(intent, fmt.Errorf("ref does not exist"))
 		return nil, fmt.Errorf("ref does not exist; create it with memory_branch_create")
 	}
 	// No local expected_head comparison here: Lethe's transactional CAS is
@@ -441,6 +467,7 @@ func (s *Server) handleMemoryChangesetCreate(ctx context.Context, request mcp.Ca
 		CreateRefIfMissing: false,
 	})
 	if err != nil {
+		s.finishAudit(intent, err)
 		s.recordLedger(reqID, principal, "memory_changeset_create", []string{project}, "error: "+sanitizeError(err), time.Since(start))
 		return nil, fmt.Errorf("changeset create failed: %w", err)
 	}
@@ -448,13 +475,16 @@ func (s *Server) handleMemoryChangesetCreate(ctx context.Context, request mcp.Ca
 	// Store idempotency; a concurrent same-key race returns the winner.
 	existingIdem, err := s.storeIdempotency(ctx, principal.ID, "memory_changeset_create", idempotencyKey, typed, "success", cs.ChangesetID)
 	if err != nil {
+		s.finishAudit(intent, err)
 		return nil, err
 	}
 	if existingIdem != nil {
+		s.finishAudit(intent, nil)
 		s.recordLedger(reqID, principal, "memory_changeset_create", []string{project}, "success (idempotent replay)", time.Since(start))
 		return s.changesetResultFromID(ctx, existingIdem.ResultingResourceID)
 	}
 
+	s.finishAudit(intent, nil)
 	data, _ := json.MarshalIndent(cs, "", "  ")
 	s.recordLedger(reqID, principal, "memory_changeset_create", []string{project}, "success", time.Since(start))
 	return mcp.NewToolResultText(string(data)), nil
@@ -544,6 +574,13 @@ func (s *Server) handleMemoryMergePropose(ctx context.Context, request mcp.CallT
 		}
 	}
 
+	intent, err := s.beginAuditIntent(ctx, principal, "memory_merge_propose", project,
+		canonical.MustDigest("charon/audit-request/v1", typed),
+		project+":"+targetRef, "create merge proposal "+headID+" -> "+targetRef)
+	if err != nil {
+		return nil, err
+	}
+
 	// Exactly-once proposal creation: the proposal row, the canonical request
 	// digest, and the idempotency record commit atomically. An exact replay
 	// returns the original proposal; a same-key different-body replay fails
@@ -577,6 +614,7 @@ func (s *Server) handleMemoryMergePropose(ctx context.Context, request mcp.CallT
 		Message:         typed.Message,
 	})
 	if err != nil {
+		s.finishAudit(intent, err)
 		s.recordLedger(reqID, principal, "memory_merge_propose", []string{project}, "error: "+sanitizeError(err), time.Since(start))
 		return nil, fmt.Errorf("merge propose failed: %w", err)
 	}
@@ -603,11 +641,13 @@ func (s *Server) handleMemoryMergePropose(ctx context.Context, request mcp.CallT
 		}
 		if len(persistSet) > 0 {
 			if err := s.lethe.PersistConflicts(ctx, project, prop.ID, persistSet); err != nil {
+				s.finishAudit(intent, err)
 				s.recordLedger(reqID, principal, "memory_merge_propose", []string{project}, "error: conflict persistence failed", time.Since(start))
 				return nil, fmt.Errorf("persist proposal conflicts: %w", err)
 			}
 		}
 	}
+	s.finishAudit(intent, nil)
 
 	data, _ := json.MarshalIndent(map[string]interface{}{
 		"proposal_id": prop.ID, "status": prop.Status, "target_ref": targetRef,
@@ -643,6 +683,12 @@ func (s *Server) handleMemoryMergeReview(ctx context.Context, request mcp.CallTo
 	if err != nil || target == nil || !target.Protected {
 		return nil, fmt.Errorf("protected target ref is unavailable")
 	}
+	intent, err := s.beginAuditIntent(ctx, principal, "memory_merge_review", p.ProjectID,
+		canonical.MustDigest("charon/audit-request/v1", map[string]string{"proposal_id": proposalID, "verdict": getString(args, "verdict")}),
+		proposalID, "attach "+getString(args, "verdict")+" review finding")
+	if err != nil {
+		return nil, err
+	}
 	p, err = s.proposalSvc.AddReviewFinding(ctx, proposalID, proposal.ReviewFinding{
 		Reviewer:              principal.ID,
 		Verdict:               proposal.ReviewVerdict(getString(args, "verdict")),
@@ -651,25 +697,29 @@ func (s *Server) handleMemoryMergeReview(ctx context.Context, request mcp.CallTo
 		TargetHeadChangesetID: target.HeadChangesetID,
 	})
 	if err != nil {
+		s.finishAudit(intent, err)
 		return nil, err
 	}
 	// A reject verdict is a terminal decision: the proposal closes and its
 	// conflicts retire so they cannot block or pollute future merges.
 	if getString(args, "verdict") == string(proposal.ReviewVerdictReject) {
 		if p, err = s.proposalSvc.Reject(ctx, proposal.RejectRequest{ProposalID: proposalID, DecidedBy: principal.ID}); err != nil {
+			s.finishAudit(intent, err)
 			return nil, fmt.Errorf("close rejected proposal: %w", err)
 		}
 		if err := s.lethe.RetireConflicts(ctx, p.ProjectID, p.ID, "rejected"); err != nil {
+			s.finishAudit(intent, err)
 			s.recordLedger(reqID, principal, "memory_merge_review", []string{p.ProjectID}, "error: conflict retirement failed: "+sanitizeError(err), time.Since(start))
 			return nil, fmt.Errorf("proposal rejected but conflict retirement failed: %w", err)
 		}
 	}
+	s.finishAudit(intent, nil)
 	data, _ := json.MarshalIndent(p, "", "  ")
 	s.recordLedger(reqID, principal, "memory_merge_review", []string{p.ProjectID}, "success", time.Since(start))
 	return mcp.NewToolResultText(string(data)), nil
 }
 
-func (s *Server) handleMemoryMerge(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleMemoryMerge(ctx context.Context, request mcp.CallToolRequest) (result *mcp.CallToolResult, mergeErr error) {
 	start := time.Now()
 	principal := authFromContext(ctx)
 	reqID := requestIDFromContext(ctx)
@@ -745,6 +795,16 @@ func (s *Server) handleMemoryMerge(ctx context.Context, request mcp.CallToolRequ
 	if err != nil || head.ProjectID != p.ProjectID {
 		return nil, fmt.Errorf("merge head is unavailable or crossed project boundary")
 	}
+
+	intent, err := s.beginAuditIntent(ctx, principal, "memory_merge", p.ProjectID,
+		canonical.MustDigest("charon/audit-request/v1", typed),
+		proposalID, "advance "+p.TargetRef+" to merge result")
+	if err != nil {
+		return nil, err
+	}
+	// Every return path after this point records its outcome: named returns
+	// let the deferred finish see the final error value.
+	defer func() { s.finishAudit(intent, mergeErr) }()
 
 	resultID := p.ChangesetID
 	if resultID != "" {
@@ -973,13 +1033,21 @@ func (s *Server) handleMemoryMergeCancel(ctx context.Context, request mcp.CallTo
 	if err := policy.RequireScope(principal, "memory.propose"); err != nil {
 		return nil, fmt.Errorf("unauthorized: %w", err)
 	}
-	p, err := s.proposalSvc.Cancel(ctx, getString(request.GetArguments(), "proposal_id"), principal.ID)
+	proposalID := getString(request.GetArguments(), "proposal_id")
+	intent, err := s.beginAuditIntent(ctx, principal, "memory_merge_cancel", "",
+		canonical.MustDigest("charon/audit-request/v1", map[string]string{"proposal_id": proposalID}),
+		proposalID, "cancel proposal and retire conflicts")
+	if err != nil {
+		return nil, err
+	}
+	p, err := s.proposalSvc.Cancel(ctx, proposalID, principal.ID)
 	if err != nil {
 		// A previous cancel may have succeeded in Charon while conflict
 		// retirement failed; allow the retry to converge instead of stranding
 		// open conflicts behind an "already decided" error.
-		existing, getErr := s.proposalSvc.Get(ctx, getString(request.GetArguments(), "proposal_id"))
+		existing, getErr := s.proposalSvc.Get(ctx, proposalID)
 		if getErr != nil || existing.Status != proposal.StatusCancelled {
+			s.finishAudit(intent, err)
 			return nil, err
 		}
 		p = existing
@@ -988,9 +1056,11 @@ func (s *Server) handleMemoryMergeCancel(ctx context.Context, request mcp.CallTo
 	// accepted-context manifests. Retirement is idempotent; if Lethe cannot be
 	// reached the caller sees the failure and can retry cancel safely.
 	if err := s.lethe.RetireConflicts(ctx, p.ProjectID, p.ID, "canceled"); err != nil {
+		s.finishAudit(intent, err)
 		s.recordLedger(reqID, principal, "memory_merge_cancel", []string{p.ProjectID}, "error: conflict retirement failed: "+sanitizeError(err), time.Since(start))
 		return nil, fmt.Errorf("proposal canceled but conflict retirement failed (retry cancel to converge): %w", err)
 	}
+	s.finishAudit(intent, nil)
 	data, _ := json.MarshalIndent(p, "", "  ")
 	s.recordLedger(reqID, principal, "memory_merge_cancel", []string{p.ProjectID}, "success", time.Since(start))
 	return mcp.NewToolResultText(string(data)), nil

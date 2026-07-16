@@ -100,6 +100,16 @@ type Config struct {
 	// authorization can never be long-lived.
 	MergeAuthorizationTTL time.Duration `env:"CHARON_MERGE_AUTH_TTL" envDefault:"2m"`
 
+	// LedgerHMACKey signs audit ledger entries (purpose-specific HMAC).
+	LedgerHMACKey string `env:"CHARON_LEDGER_HMAC_KEY"`
+
+	// LedgerKeyID identifies the active ledger key for rotation.
+	LedgerKeyID string `env:"CHARON_LEDGER_KEY_ID"`
+
+	// LedgerAnchorPath is an append-only file outside the database that
+	// anchors every committed ledger tail for rollback detection.
+	LedgerAnchorPath string `env:"CHARON_LEDGER_ANCHOR_PATH"`
+
 	// MaxResultBytes caps MCP tool response sizes.
 	MaxResultBytes int `env:"CHARON_MAX_RESULT_BYTES" envDefault:"1048576"`
 
@@ -198,6 +208,9 @@ func FromEnv() (*Config, error) {
 		MergeHMACKey:               firstNonEmpty(os.Getenv("CHARON_MERGE_HMAC_KEY"), os.Getenv("CHARON_HMAC_KEY")),
 		MergeHMACKeyID:             os.Getenv("CHARON_MERGE_HMAC_KEY_ID"),
 		MergeAuthorizationTTL:      mergeAuthTTL,
+		LedgerHMACKey:              firstNonEmpty(os.Getenv("CHARON_LEDGER_HMAC_KEY"), os.Getenv("CHARON_HMAC_KEY")),
+		LedgerKeyID:                os.Getenv("CHARON_LEDGER_KEY_ID"),
+		LedgerAnchorPath:           os.Getenv("CHARON_LEDGER_ANCHOR_PATH"),
 		MaxResultBytes:             maxResultBytes,
 		MaxResultCount:             maxResultCount,
 		MaxRequestBytes:            int64(maxRequestBytes),
@@ -350,6 +363,9 @@ func firstNonEmpty(values ...string) string {
 func (c *Config) ObolKey() string  { return firstNonEmpty(c.ObolHMACKey, c.HMACKey) }
 func (c *Config) OAuthKey() string { return firstNonEmpty(c.OAuthHMACKey, c.HMACKey) }
 func (c *Config) MergeKey() string { return firstNonEmpty(c.MergeHMACKey, c.HMACKey) }
+
+// LedgerKey returns the purpose-specific ledger key or the legacy fallback.
+func (c *Config) LedgerKey() string { return firstNonEmpty(c.LedgerHMACKey, c.HMACKey) }
 
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {

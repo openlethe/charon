@@ -11,6 +11,7 @@ import (
 	"time"
 
 	markmcp "github.com/mark3labs/mcp-go/mcp"
+	"github.com/openlethe/charon/internal/audit"
 	"github.com/openlethe/charon/internal/auth"
 	"github.com/openlethe/charon/internal/config"
 	"github.com/openlethe/charon/internal/idempotency"
@@ -28,7 +29,7 @@ func newMemoryGitPolicyServer(t *testing.T) (*Server, *proposal.Service) {
 	}
 	t.Cleanup(func() { db.Close() })
 	proposalSvc := proposal.NewService(db, nil)
-	return NewServer(&config.Config{MaxResultCount: 100}, nil, ledger.NewService(db), proposalSvc, idempotency.NewService(db)), proposalSvc
+	return NewServer(&config.Config{MaxResultCount: 100}, nil, ledger.NewService(db), proposalSvc, idempotency.NewService(db), audit.NewService(db)), proposalSvc
 }
 
 func TestMemoryGitOwnedRefPolicy(t *testing.T) {
@@ -69,7 +70,7 @@ func TestMemoryRepoInitRequiresCommitOnExactProject(t *testing.T) {
 	}
 	defer db.Close()
 	client := lethe.NewClient(upstream.URL, "key", time.Second, 1<<20)
-	server := NewServer(&config.Config{MaxResultCount: 100}, client, ledger.NewService(db), proposal.NewService(db, client), idempotency.NewService(db))
+	server := NewServer(&config.Config{MaxResultCount: 100}, client, ledger.NewService(db), proposal.NewService(db, client), idempotency.NewService(db), audit.NewService(db))
 	request := markmcp.CallToolRequest{}
 	request.Params.Arguments = map[string]interface{}{"project": "allowed"}
 
@@ -182,7 +183,7 @@ func TestMemoryMergeReviewBindsCurrentProtectedTarget(t *testing.T) {
 	defer db.Close()
 	client := lethe.NewClient(upstream.URL, "key", time.Second, 1<<20)
 	proposalSvc := proposal.NewService(db, client)
-	server := NewServer(&config.Config{MaxResultCount: 100}, client, ledger.NewService(db), proposalSvc, idempotency.NewService(db))
+	server := NewServer(&config.Config{MaxResultCount: 100}, client, ledger.NewService(db), proposalSvc, idempotency.NewService(db), audit.NewService(db))
 	p, err := proposalSvc.Create(context.Background(), proposal.CreateRequest{
 		ProjectID: "lethe", EventType: "merge_request", Kind: "merge_request",
 		Provenance: proposal.Provenance{Principal: "author"}, IdempotencyKey: "proposal-review-target",
@@ -293,7 +294,7 @@ func TestMemoryContextAtUsesPolicyAndPinsManifest(t *testing.T) {
 	}
 	defer db.Close()
 	client := lethe.NewClient(upstream.URL, "key", time.Second, 1<<20)
-	server := NewServer(&config.Config{MaxResultCount: 100}, client, ledger.NewService(db), proposal.NewService(db, client), idempotency.NewService(db))
+	server := NewServer(&config.Config{MaxResultCount: 100}, client, ledger.NewService(db), proposal.NewService(db, client), idempotency.NewService(db), audit.NewService(db))
 	principal := auth.Principal{
 		ID: "principal-chatgpt", AgentID: "chatgpt",
 		Projects: map[string]struct{}{"allowed": {}},
@@ -379,7 +380,7 @@ func TestMemoryDiffRejectsCrossProjectBaseBeforeDiff(t *testing.T) {
 	}
 	defer db.Close()
 	client := lethe.NewClient(upstream.URL, "key", time.Second, 1<<20)
-	server := NewServer(&config.Config{MaxResultCount: 100}, client, ledger.NewService(db), proposal.NewService(db, client), idempotency.NewService(db))
+	server := NewServer(&config.Config{MaxResultCount: 100}, client, ledger.NewService(db), proposal.NewService(db, client), idempotency.NewService(db), audit.NewService(db))
 	request := markmcp.CallToolRequest{}
 	request.Params.Arguments = map[string]interface{}{"target_changeset_id": "target", "base_changeset_id": "base"}
 	ctx := WithAuth(context.Background(), auth.Principal{
@@ -418,7 +419,7 @@ func TestMemoryChangesetCreateIdempotencyStrictMatching(t *testing.T) {
 	}
 	defer db.Close()
 	client := lethe.NewClient(upstream.URL, "key", time.Second, 1<<20)
-	server := NewServer(&config.Config{MaxResultCount: 100}, client, ledger.NewService(db), proposal.NewService(db, client), idempotency.NewService(db))
+	server := NewServer(&config.Config{MaxResultCount: 100}, client, ledger.NewService(db), proposal.NewService(db, client), idempotency.NewService(db), audit.NewService(db))
 
 	ctx := WithAuth(context.Background(), auth.Principal{
 		ID: "principal-chatgpt", AgentID: "chatgpt", Projects: map[string]struct{}{"lethe": {}},
@@ -496,7 +497,7 @@ func TestMemoryChangesetCreateRetryAfterCrashReplaysUpstream(t *testing.T) {
 		}
 		t.Cleanup(func() { db.Close() })
 		client := lethe.NewClient(upstream.URL, "key", time.Second, 1<<20)
-		return NewServer(&config.Config{MaxResultCount: 100}, client, ledger.NewService(db), proposal.NewService(db, client), idempotency.NewService(db))
+		return NewServer(&config.Config{MaxResultCount: 100}, client, ledger.NewService(db), proposal.NewService(db, client), idempotency.NewService(db), audit.NewService(db))
 	}
 	ctx := WithAuth(context.Background(), auth.Principal{
 		ID: "principal-chatgpt", AgentID: "chatgpt", Projects: map[string]struct{}{"lethe": {}},
@@ -561,7 +562,7 @@ func TestMemoryMergeRetryAfterCrashRecoversPendingProposal(t *testing.T) {
 	defer db.Close()
 	client := lethe.NewClient(upstream.URL, "key", time.Second, 1<<20)
 	proposalSvc := proposal.NewService(db, client)
-	server := NewServer(&config.Config{MaxResultCount: 100}, client, ledger.NewService(db), proposalSvc, idempotency.NewService(db))
+	server := NewServer(&config.Config{MaxResultCount: 100}, client, ledger.NewService(db), proposalSvc, idempotency.NewService(db), audit.NewService(db))
 
 	p, err := proposalSvc.Create(context.Background(), proposal.CreateRequest{
 		ProjectID: "lethe", EventType: "merge_request", Kind: "merge_request",

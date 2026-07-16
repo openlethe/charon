@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/openlethe/charon/internal/audit"
 	"github.com/openlethe/charon/internal/auth"
 	"github.com/openlethe/charon/internal/config"
 	"github.com/openlethe/charon/internal/idempotency"
@@ -43,6 +44,19 @@ type Server struct {
 func NewServer(cfg *config.Config, db *store.DB, logger *slog.Logger) (*Server, error) {
 	obolSvc := obol.NewService(db, cfg.ObolKey())
 	ledgerSvc := ledger.NewService(db)
+	if key := cfg.LedgerKey(); len(key) >= 32 {
+		ledgerSvc.SetIntegrityKey([]byte(key), cfg.LedgerKeyID)
+	} else {
+		logger.Warn("ledger integrity key missing or shorter than 32 characters; ledger entries are hash-chained but not MAC-signed")
+	}
+	ledgerSvc.SetAnchorPath(cfg.LedgerAnchorPath)
+	auditSvc := audit.NewService(db)
+	if reconciled, err := auditSvc.ReconcileAfterRestart(context.Background()); err != nil {
+		return nil, fmt.Errorf("audit outbox reconciliation: %w", err)
+	} else if reconciled > 0 {
+		logger.Warn("audit intents from before the restart marked ambiguous; investigate before relying on affected resources",
+			"reconciled", reconciled)
+	}
 	letheClient := lethe.NewClient(cfg.Upstream, cfg.LetheAPIKey, cfg.RequestTimeout, int64(cfg.MaxResultBytes))
 	letheClient.SetMergeSigningKey(cfg.MergeKey())
 	letheClient.SetMergeSigningKeyID(cfg.MergeHMACKeyID)
@@ -61,7 +75,7 @@ func NewServer(cfg *config.Config, db *store.DB, logger *slog.Logger) (*Server, 
 			"quarantined", quarantined)
 	}
 	idempotencySvc := idempotency.NewService(db)
-	mcpServer := mcp.NewServer(cfg, letheClient, ledgerSvc, proposalSvc, idempotencySvc)
+	mcpServer := mcp.NewServer(cfg, letheClient, ledgerSvc, proposalSvc, idempotencySvc, auditSvc)
 
 	// Initialize OAuth service with HMAC key and client ID
 	var oauthSvc *oauth.Service

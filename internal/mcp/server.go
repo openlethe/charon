@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/openlethe/charon/internal/audit"
 	"github.com/openlethe/charon/internal/auth"
 	"github.com/openlethe/charon/internal/config"
 	"github.com/openlethe/charon/internal/idempotency"
@@ -48,16 +50,18 @@ type Server struct {
 	ledger      *ledger.Service
 	proposalSvc *proposal.Service
 	idempotency *idempotency.Service
+	audit       *audit.Service
 	cfg         *config.Config
 }
 
 // NewServer creates a Charon MCP server.
-func NewServer(cfg *config.Config, letheClient *lethe.Client, ledgerSvc *ledger.Service, proposalSvc *proposal.Service, idempotencySvc *idempotency.Service) *Server {
+func NewServer(cfg *config.Config, letheClient *lethe.Client, ledgerSvc *ledger.Service, proposalSvc *proposal.Service, idempotencySvc *idempotency.Service, auditSvc *audit.Service) *Server {
 	s := &Server{
 		lethe:       letheClient,
 		ledger:      ledgerSvc,
 		proposalSvc: proposalSvc,
 		idempotency: idempotencySvc,
+		audit:       auditSvc,
 		cfg:         cfg,
 	}
 
@@ -864,6 +868,75 @@ func (s *Server) recordLedger(reqID string, principal auth.Principal, operation 
 			"error", sanitizeError(err),
 		)
 	}
+}
+
+// beginAuditIntent persists a durable audit intent before any side effect of
+// a security-relevant mutation. A failure means audit persistence is
+// unavailable and the mutation MUST NOT proceed — this is the fail-closed
+// gate; reads and denials stay on the fail-open ledger path above.
+func (s *Server) beginAuditIntent(ctx context.Context, principal auth.Principal, operation, project, digest, target, transition string) (*audit.Intent, error) {
+	if s.audit == nil {
+		return nil, fmt.Errorf("audit service unavailable; mutation refused")
+	}
+	intent, err := s.audit.BeginIntent(ctx, audit.Intent{
+		RequestID:          requestIDFromContext(ctx),
+		PrincipalID:        principal.ID,
+		Operation:          operation,
+		ProjectID:          project,
+		RequestDigest:      digest,
+		TargetResource:     target,
+		IntendedTransition: transition,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("audit persistence unavailable; mutation refused: %w", err)
+	}
+	return intent, nil
+}
+
+// finishAudit records the mutation outcome: ambiguous when the cross-service
+// outcome is unknowable (timeout/transport failure after the request may have
+// committed), failed when it definitively did not happen, completed otherwise.
+// An outcome-write failure is logged loudly; the stranded intent is marked
+// ambiguous by restart reconciliation.
+func (s *Server) finishAudit(intent *audit.Intent, opErr error) {
+	if intent == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	var err error
+	outcome := "completed"
+	switch {
+	case opErr == nil:
+		err = s.audit.Complete(ctx, intent.IntentID, "")
+	case isAmbiguousOutcome(opErr):
+		outcome = "ambiguous"
+		err = s.audit.Ambiguous(ctx, intent.IntentID, sanitizeError(opErr))
+	default:
+		outcome = "failed"
+		err = s.audit.Fail(ctx, intent.IntentID, sanitizeError(opErr))
+	}
+	if err != nil {
+		slog.Error("audit outcome write failed; intent stranded for restart reconciliation",
+			"intent_id", intent.IntentID,
+			"operation", intent.Operation,
+			"outcome", outcome,
+			"error", sanitizeError(err),
+		)
+	}
+}
+
+// isAmbiguousOutcome reports whether an upstream error leaves the outcome
+// unknowable: the request may have committed before the failure surfaced.
+func isAmbiguousOutcome(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	return false
 }
 
 // sanitizeError redacts potentially sensitive information from error strings

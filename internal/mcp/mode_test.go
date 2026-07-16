@@ -8,6 +8,7 @@ import (
 
 	mcpclient "github.com/mark3labs/mcp-go/client"
 	markmcp "github.com/mark3labs/mcp-go/mcp"
+	"github.com/openlethe/charon/internal/audit"
 	"github.com/openlethe/charon/internal/config"
 	"github.com/openlethe/charon/internal/idempotency"
 	"github.com/openlethe/charon/internal/ledger"
@@ -28,6 +29,7 @@ func TestMemoryGitModeRegistersOnlyVersionedTools(t *testing.T) {
 		ledger.NewService(db),
 		proposal.NewService(db, nil),
 		idempotency.NewService(db),
+		audit.NewService(db),
 	)
 	httpServer := httptest.NewServer(srv)
 	defer httpServer.Close()

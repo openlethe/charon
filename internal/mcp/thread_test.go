@@ -10,6 +10,7 @@ import (
 	"time"
 
 	markmcp "github.com/mark3labs/mcp-go/mcp"
+	"github.com/openlethe/charon/internal/audit"
 	"github.com/openlethe/charon/internal/auth"
 	"github.com/openlethe/charon/internal/config"
 	"github.com/openlethe/charon/internal/idempotency"
@@ -41,6 +42,7 @@ func TestThreadListDenialDoesNotLeakProjectID(t *testing.T) {
 		ledger.NewService(db),
 		proposal.NewService(db, client),
 		idempotency.NewService(db),
+		audit.NewService(db),
 	)
 	request := markmcp.CallToolRequest{}
 	request.Params.Arguments = map[string]interface{}{"session_id": "known-session"}

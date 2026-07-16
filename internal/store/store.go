@@ -108,6 +108,12 @@ func (db *DB) migrate() error {
 		}
 	}
 
+	if currentVersion < 6 {
+		if err := db.migrateV6(); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -320,6 +326,52 @@ func (db *DB) migrateV5() error {
 		}
 	}
 	if err := recordMigration(ctx, tx, 5); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// migrateV6 makes the audit trail a security control. audit_outbox records
+// durable mutation intents and their outcomes so no protected mutation can
+// succeed without audit evidence and every ambiguous cross-service outcome is
+// recoverable. Ledger entries gain a purpose-specific keyed MAC (with key ID
+// for rotation) so tampering cannot be hidden by recomputing the unkeyed
+// same-database hash chain.
+func (db *DB) migrateV6() error {
+	ctx := context.Background()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	statements := []string{
+		`CREATE TABLE audit_outbox (
+			intent_id TEXT PRIMARY KEY,
+			request_id TEXT NOT NULL,
+			principal_id TEXT NOT NULL,
+			operation TEXT NOT NULL,
+			project_id TEXT,
+			request_digest TEXT,
+			target_resource TEXT,
+			intended_transition TEXT,
+			status TEXT NOT NULL DEFAULT 'intent' CHECK (status IN ('intent', 'completed', 'failed', 'ambiguous')),
+			detail TEXT,
+			created_at TEXT NOT NULL,
+			completed_at TEXT
+		)`,
+		`CREATE INDEX idx_audit_outbox_status ON audit_outbox(status, created_at)`,
+		`CREATE INDEX idx_audit_outbox_operation ON audit_outbox(operation, created_at)`,
+		`ALTER TABLE ledger_entries ADD COLUMN key_id TEXT`,
+		`ALTER TABLE ledger_entries ADD COLUMN entry_mac BLOB`,
+	}
+
+	for _, stmt := range statements {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("migration v6: %w", err)
+		}
+	}
+	if err := recordMigration(ctx, tx, 6); err != nil {
 		return err
 	}
 	return tx.Commit()
