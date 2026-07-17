@@ -276,7 +276,12 @@ func (s *Service) Verify(ctx context.Context) (int64, error) {
 		if len(entry.EntryMAC) == 0 && seenMAC {
 			return count, fmt.Errorf("ledger sequence %d is missing MAC material after MACed entries exist (stripped or forged)", entry.Sequence)
 		}
-		if len(entry.EntryMAC) > 0 && len(s.keys) > 0 {
+		if len(entry.EntryMAC) > 0 && len(s.keys) == 0 {
+			// A MACed entry claims keyed protection; without the key it cannot
+			// be verified, and silently skipping it would forge confidence.
+			return count, fmt.Errorf("ledger sequence %d is MAC-signed but no ledger integrity key is configured", entry.Sequence)
+		}
+		if len(entry.EntryMAC) > 0 {
 			key, ok := s.keys[entry.KeyID]
 			if !ok {
 				return count, fmt.Errorf("ledger sequence %d uses unknown key id %q", entry.Sequence, entry.KeyID)

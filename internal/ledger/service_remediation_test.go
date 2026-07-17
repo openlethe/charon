@@ -240,3 +240,15 @@ func TestLegacyPrefixThenMACedEntriesVerify(t *testing.T) {
 		t.Fatalf("legacy prefix + MACed suffix must verify: %v", err)
 	}
 }
+
+// MAC-signed rows must fail closed when verification runs without the key:
+// silently skipping them would fabricate a clean result.
+func TestMACedRowsRequireKey(t *testing.T) {
+	svc, db := openKeyedLedger(t, "")
+	record(t, svc, "op-a")
+
+	unkeyed := NewService(db)
+	if _, err := unkeyed.Verify(context.Background()); err == nil || !strings.Contains(err.Error(), "no ledger integrity key") {
+		t.Fatalf("MACed rows verified without a key: %v", err)
+	}
+}
