@@ -434,6 +434,15 @@ func (s *Server) handleMemoryChangesetCreate(ctx context.Context, request mcp.Ca
 		return s.changesetResultFromID(ctx, existing.ResultingResourceID)
 	}
 
+	// Parent shaping is pure validation and must happen before the audit
+	// intent so a malformed request never leaves an open intent behind.
+	parents := typed.ParentIDs
+	if len(parents) == 0 {
+		parents = []string{typed.ExpectedHead}
+	} else if parents[0] != typed.ExpectedHead {
+		return nil, fmt.Errorf("first parent must match expected_head")
+	}
+
 	intent, err := s.beginAuditIntent(ctx, principal, "memory_changeset_create", project,
 		canonical.MustDigest("charon/audit-request/v1", typed),
 		project+":"+refName, "commit changeset and advance ref")
@@ -456,13 +465,6 @@ func (s *Server) handleMemoryChangesetCreate(ctx context.Context, request mcp.Ca
 	// (the ref already advanced to the changeset the first call created)
 	// instead of letting Lethe's strict idempotency replay the original
 	// result; genuine stale-head conflicts still fail upstream.
-
-	parents := typed.ParentIDs
-	if len(parents) == 0 {
-		parents = []string{expectedHead}
-	} else if parents[0] != expectedHead {
-		return nil, fmt.Errorf("first parent must match expected_head")
-	}
 
 	cs, err := s.lethe.CreateChangeset(ctx, lethe.CreateChangesetRequest{
 		ProjectID:          project,
@@ -825,8 +827,17 @@ func (s *Server) handleMemoryMerge(ctx context.Context, request mcp.CallToolRequ
 		return nil, err
 	}
 	// Every return path after this point records its outcome: named returns
-	// let the deferred finish see the final error value.
-	defer func() { s.finishAudit(intent, mergeErr) }()
+	// let the deferred finish see the final error value. Once the protected
+	// ref has moved (landed), a later local bookkeeping error must not record
+	// the merge as failed — the true outcome is ambiguous.
+	landed := false
+	defer func() {
+		if mergeErr != nil && landed {
+			s.finishAuditAmbiguous(intent, mergeErr)
+			return
+		}
+		s.finishAudit(intent, mergeErr)
+	}()
 
 	resultID := p.ChangesetID
 	if resultID != "" {
@@ -850,6 +861,11 @@ func (s *Server) handleMemoryMerge(ctx context.Context, request mcp.CallToolRequ
 			if err := s.advanceProtectedMerge(ctx, p, target.HeadChangesetID, resultID, reviewer, principal.ID, strategy); err != nil {
 				return nil, fmt.Errorf("recover protected merge: %w", err)
 			}
+			landed = true
+		} else {
+			// The ref already points at the merge result: it landed in a
+			// previous attempt even though bookkeeping did not finish.
+			landed = true
 		}
 	} else if len(p.SelectedOps) > 0 {
 		selected := make([]lethe.SemanticOp, 0, len(p.SelectedOps))
@@ -883,6 +899,7 @@ func (s *Server) handleMemoryMerge(ctx context.Context, request mcp.CallToolRequ
 		if err := s.advanceProtectedMerge(ctx, p, target.HeadChangesetID, resultID, reviewer, principal.ID, lethe.StrategyCherryPick); err != nil {
 			return nil, fmt.Errorf("cherry-pick merge failed: %w", err)
 		}
+		landed = true
 	} else {
 		ancestor, err := s.isChangesetAncestor(ctx, p.BaseChangesetID, p.HeadChangesetID, p.ProjectID)
 		if err != nil {
@@ -891,6 +908,7 @@ func (s *Server) handleMemoryMerge(ctx context.Context, request mcp.CallToolRequ
 		if target.HeadChangesetID == p.HeadChangesetID {
 			// Recovery path when Lethe CAS succeeded but Charon status update did not.
 			resultID = p.HeadChangesetID
+			landed = true
 		} else if target.HeadChangesetID == p.BaseChangesetID && ancestor {
 			p, err = s.proposalSvc.SetMergeResult(ctx, p.ID, p.HeadChangesetID)
 			if err != nil {
@@ -899,6 +917,7 @@ func (s *Server) handleMemoryMerge(ctx context.Context, request mcp.CallToolRequ
 			if err := s.advanceProtectedMerge(ctx, p, target.HeadChangesetID, p.HeadChangesetID, reviewer, principal.ID, lethe.StrategyFastForward); err != nil {
 				return nil, fmt.Errorf("fast-forward merge failed: %w", err)
 			}
+			landed = true
 			resultID = p.HeadChangesetID
 		} else {
 			conflicts, err := s.lethe.DetectConflicts(ctx, p.ProjectID, lethe.DetectConflictsRequest{
@@ -954,6 +973,7 @@ func (s *Server) handleMemoryMerge(ctx context.Context, request mcp.CallToolRequ
 			if err := s.advanceProtectedMerge(ctx, p, target.HeadChangesetID, resultID, reviewer, principal.ID, lethe.StrategyMergeCommit); err != nil {
 				return nil, fmt.Errorf("reviewed merge failed: %w", err)
 			}
+			landed = true
 		}
 	}
 

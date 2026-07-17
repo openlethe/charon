@@ -952,6 +952,26 @@ func (s *Server) finishAudit(intent *audit.Intent, opErr error) {
 	}
 }
 
+// finishAuditAmbiguous records an ambiguous outcome for a mutation whose
+// upstream side effect LANDED before a later local step failed: the audit
+// trail must not call a landed mutation "failed", and reconciliation needs
+// the ambiguity visible.
+func (s *Server) finishAuditAmbiguous(intent *audit.Intent, opErr error) {
+	if intent == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := s.audit.Ambiguous(ctx, intent.IntentID, sanitizeError(opErr)); err != nil {
+		metrics.Inc(metrics.AuditAppendFailures)
+		slog.Error("audit ambiguous-outcome write failed; intent stranded for restart reconciliation",
+			"intent_id", intent.IntentID,
+			"operation", intent.Operation,
+			"error", sanitizeError(err),
+		)
+	}
+}
+
 // isAmbiguousOutcome reports whether an upstream error leaves the outcome
 // unknowable: the request may have committed before the failure surfaced.
 func isAmbiguousOutcome(err error) bool {
