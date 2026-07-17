@@ -5,6 +5,7 @@
 /bin/*
 !/bin/charon
 /dist/
+/build/
 *.exe
 *.test
 *.out
@@ -21,6 +22,8 @@ coverage.html
 /charon-data/
 /charon-memory-git-data/
 /lethe-data/
+/e2e-output/
+/.local/
 /secrets/
 /workspace/
 /code/
@@ -36,14 +39,21 @@ coverage.html
 .env
 .env.*
 !.env.example
+!.env.*.example
 !.env.minimal
 .envrc
 .direnv/
+*.pem
+*.key
+*.crt
 
 # Local backups, logs, caches, and temporary files
 /docker-compose.yaml.backup
 *.bak
 *.backup
+*.bak-*
+docker-compose*.backup
+docker-compose*.bak
 *.log
 *.tmp
 *.swp
@@ -51,6 +61,14 @@ coverage.html
 *~
 .cache/
 /tmp/
+
+# Internal audits and remediation records (kept local)
+/internal-audits/
+/review-artifacts/
+/remediation-handoffs/
+*_AUDIT.md
+*_REMEDIATION_HANDOFF.md
+*_PRODUCTION_REVIEW.md
 
 # IDE and editor metadata
 .vscode/
