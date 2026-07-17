@@ -1,12 +1,14 @@
 # Local Memory Reviewer Runbook
 
-> **Scope:** Configure and operate the local Archimedes agent as a dedicated, independent Charon Memory Git reviewer for project `Archimedes`.
-> **Last updated:** 2026-07-16
+> **Scope:** Configure and operate a local agent as a dedicated, independent
+> Charon Memory Git reviewer for one exact project.
+> Substitute your own case-sensitive project ID wherever `<project>` appears,
+> and record the values your deployment produces in the table at the end.
 
 ## Architecture
 
 ```text
-Public MCP clients                  OpenClaw reviewer (Archimedes)
+Public MCP clients                  Local reviewer agent
         | OAuth                                  | Obol
         v                                        v
 Charon main gateway                    Charon reviewer gateway
@@ -22,9 +24,9 @@ charon-charon-1                         charon-charon-reviewer-1
 **Data ownership:**
 
 - The main and reviewer Charon gateways share principals, grants, scopes, proposals, review findings, Obols, idempotency records, and the audit ledger in `/data/charon.db` inside the persistent `charon_charon-data` Docker volume. Ledger appends acquire a cross-process SQLite write lock before reading the predecessor hash.
-- Lethe Git (`lethe-git-local`) owns semantic changesets, ref heads, accepted shared memory, protected-ref history, context manifests, and conflict records. It stores these in `/data/lethe.db` inside the host bind-mounted directory `/Users/michaelwyatt/.openclaw/workspace/lethe/lethe-git-data`.
-- OpenClaw stores the MCP server definition in `/Users/michaelwyatt/.openclaw/openclaw.json`.
-- The reviewer's Obol credential is stored in `/Users/michaelwyatt/.openclaw/workspace/secrets/charon-local-reviewer.obol` (mode `0600`).
+- Lethe Git (`lethe-git-local`) owns semantic changesets, ref heads, accepted shared memory, protected-ref history, context manifests, and conflict records. It stores these in `/data/lethe.db` inside the host bind-mounted data directory (`./lethe-git-data` in the Lethe repository by default).
+- OpenClaw (or another MCP client) stores the MCP server definition in its own client configuration.
+- The reviewer's Obol credential is stored outside version control in a mode-`0600` file, conventionally `secrets/reviewer-obol.txt` in the Charon repository.
 
 **Separation of duties:**
 
@@ -36,22 +38,22 @@ charon-charon-1                         charon-charon-reviewer-1
 
 | Service | Container | Database path inside container | Host path |
 |---------|-----------|-------------------------------|-----------|
-| Charon policy DB | `charon-charon-1`, `charon-charon-reviewer-1` | `/data/charon.db` | `/var/lib/docker/volumes/charon_charon-data/_data/charon.db` |
-| Lethe Git | `lethe-git-local` | `/data/lethe.db` | `/Users/michaelwyatt/.openclaw/workspace/lethe/lethe-git-data/lethe.db` |
+| Charon policy DB | `charon-charon-1`, `charon-charon-reviewer-1` | `/data/charon.db` | Docker volume `charon_charon-data` |
+| Lethe Git | `lethe-git-local` | `/data/lethe.db` | `<lethe-repo>/lethe-git-data/lethe.db` |
 
 Both databases use SQLite WAL mode. Neither is ephemeral.
 
 ## Backup and restore procedure
 
-Backups are stored in `/Users/michaelwyatt/.openclaw/workspace/backups/charon-lethe-git/` with mode `0700`.
+Store backups in a dedicated directory (for example `backups/charon-lethe-git/`) with mode `0700`, outside version control.
 
 ### Lethe Git backup (no downtime)
 
 ```bash
-sqlite3 /Users/michaelwyatt/.openclaw/workspace/lethe/lethe-git-data/lethe.db \
-  ".backup /Users/michaelwyatt/.openclaw/workspace/backups/charon-lethe-git/lethe-git-before-<reason>.db"
+sqlite3 <lethe-repo>/lethe-git-data/lethe.db \
+  ".backup backups/charon-lethe-git/lethe-git-before-<reason>.db"
 
-sqlite3 /Users/michaelwyatt/.openclaw/workspace/backups/charon-lethe-git/lethe-git-before-<reason>.db \
+sqlite3 backups/charon-lethe-git/lethe-git-before-<reason>.db \
   "PRAGMA integrity_check;"
 ```
 
@@ -60,14 +62,14 @@ sqlite3 /Users/michaelwyatt/.openclaw/workspace/backups/charon-lethe-git/lethe-g
 Charon runs in read-only containers with one SQLite database in a Docker volume. The host cannot access the volume file directly, so stop both database users for a consistent snapshot:
 
 ```bash
-cd /Users/michaelwyatt/.openclaw/workspace/charon
+cd <charon-repo>
 docker stop charon-charon-reviewer-1 charon-charon-1
 docker cp charon-charon-1:/data/charon.db \
-  /Users/michaelwyatt/.openclaw/workspace/backups/charon-lethe-git/charon-raw.db
-sqlite3 /Users/michaelwyatt/.openclaw/workspace/backups/charon-lethe-git/charon-raw.db \
-  ".backup /Users/michaelwyatt/.openclaw/workspace/backups/charon-lethe-git/charon-before-<reason>.db"
-rm /Users/michaelwyatt/.openclaw/workspace/backups/charon-lethe-git/charon-raw.db
-sqlite3 /Users/michaelwyatt/.openclaw/workspace/backups/charon-lethe-git/charon-before-<reason>.db \
+  backups/charon-lethe-git/charon-raw.db
+sqlite3 backups/charon-lethe-git/charon-raw.db \
+  ".backup backups/charon-lethe-git/charon-before-<reason>.db"
+rm backups/charon-lethe-git/charon-raw.db
+sqlite3 backups/charon-lethe-git/charon-before-<reason>.db \
   "PRAGMA integrity_check;"
 docker compose up -d charon charon-reviewer
 ```
@@ -83,19 +85,19 @@ To restore Charon from backup:
 To restore Lethe Git from backup:
 
 1. Stop `lethe-git-local`.
-2. Copy the backup `.db` file over `/Users/michaelwyatt/.openclaw/workspace/lethe/lethe-git-data/lethe.db`.
+2. Copy the backup `.db` file over `<lethe-repo>/lethe-git-data/lethe.db`.
 3. Start `lethe-git-local`.
 
 ## Reviewer-principal setup
 
-Create the reviewer principal with review-only scopes for the exact project `Archimedes`:
+Create the reviewer principal with review-only scopes for the exact project:
 
 ```bash
-cd /Users/michaelwyatt/.openclaw/workspace/charon
+cd <charon-repo>
 docker compose exec charon-reviewer charon principal reconcile \
   "Local Memory Reviewer" \
   review \
-  Archimedes
+  <project>
 ```
 
 This grants:
@@ -109,29 +111,28 @@ This grants:
 
 It does **not** grant `memory.branch`, `memory.commit`, `memory.propose`, or `memory.write`.
 
-Capture the returned `principal_...` ID. The current reviewer principal is `principal_d2b928d116379e01`.
+Capture the returned `principal_...` ID and record it as the reviewer principal for all later steps.
 
 ## Local agent MCP configuration
 
-1. Mint an Obol for the reviewer principal:
+1. Mint an Obol for the reviewer principal. Obols are audience-bound to the gateway that mints them, so mint through the Obol listener (`charon-reviewer`), not the OAuth-only primary gateway:
 
 ```bash
-cd /Users/michaelwyatt/.openclaw/workspace/charon
-docker compose exec charon-reviewer charon obol mint principal_d2b928d116379e01
+cd <charon-repo>
+docker compose exec charon-reviewer charon obol mint --expires 7d <reviewer-principal-id>
 ```
 
-2. Store the credential securely. The recommended path is:
+2. Store the credential securely, for example `secrets/reviewer-obol.txt` in the Charon repository (covered by `.gitignore`):
 
 ```bash
-/Users/michaelwyatt/.openclaw/workspace/secrets/charon-local-reviewer.obol
-chmod 600 /Users/michaelwyatt/.openclaw/workspace/secrets/charon-local-reviewer.obol
+chmod 600 secrets/reviewer-obol.txt
 ```
 
-3. Add the MCP server to OpenClaw. Use a script or non-interactive command to avoid leaving the token in shell history:
+3. Add the MCP server to the client. Use a script or non-interactive command to avoid leaving the token in shell history (OpenClaw example):
 
 ```bash
 TOKEN=$(grep -oE 'Token: obol_[A-Za-z0-9_-]+' \
-  /Users/michaelwyatt/.openclaw/workspace/secrets/charon-local-reviewer.obol \
+  secrets/reviewer-obol.txt \
   | sed 's/Token: //')
 
 openclaw mcp add charon-local-reviewer \
@@ -149,7 +150,7 @@ Do not connect directly to Lethe Git. All agent access must pass through Charon 
 
 Approve a merge proposal only when **all** of the following are true:
 
-- Project is exactly `Archimedes`.
+- Project is exactly the intended, case-sensitive project ID.
 - Target ref is the intended protected shared ref (`refs/shared/main`).
 - Proposal originator is a different principal from the reviewer.
 - Source changeset belongs to the same project.
@@ -207,47 +208,51 @@ Do **not** use `charon proposal approve <proposal-id>`. That CLI command belongs
 
 To rotate the reviewer Obol:
 
-1. Mint a new Obol for the reviewer principal.
-2. Update the MCP server header in OpenClaw with the new token.
+1. Mint a new Obol for the reviewer principal (through the `charon-reviewer` gateway, as above).
+2. Update the MCP server header in the client with the new token.
 3. Reload the MCP runtime.
 4. Revoke the old Obol:
 
 ```bash
-cd /Users/michaelwyatt/.openclaw/workspace/charon
+cd <charon-repo>
 docker compose exec charon-reviewer charon obol revoke <old-obol-id>
 ```
+
+`scripts/rotate-tokens.sh` performs this for all deployment roles at once without printing token values.
 
 ## Incident recovery
 
 | Symptom | Likely cause | Check first |
 |---------|-------------|-------------|
 | MCP connection fails | Reviewer gateway not running | Check `charon-charon-reviewer-1` |
-| `unauthorized` on MCP | Obol expired/revoked or wrong principal | `charon obol ls <principal-id>` |
-| Missing write tools | Reviewer principal lacks author scopes | `memory_status` scopes |
+| `unauthorized` on MCP | Obol expired/revoked, wrong principal, or token minted with the wrong gateway audience | `charon obol ls <principal-id>` |
+| Missing write tools | Reviewer principal lacks author scopes (by design) | `memory_status` scopes |
 | Merge denied | No current approval or stale proposal | Proposal `review_findings_json` and target head |
 | `memory_status` unavailable | Client safety layer | Use `memory_ref_list`, `memory_log`, `memory_context_at` |
 
 ## Operational notes
 
-- Both Charon gateways must run in `memory-git` mode and point to `http://host.docker.internal:18485` (Lethe Git), not OpenLethe on `18483`.
+- Both Charon gateways must run in `memory-git` mode and point to Lethe Git (`http://host.docker.internal:18485` in the reference Compose deployment), not OpenLethe on `18483`.
 - The main `18484` gateway is OAuth-only; the loopback-only `18486` reviewer gateway is Obol-only. The isolated `18487` E2E gateway remains a separate test system.
 - The protected shared memory ref is `refs/shared/main`.
 - Never write directly to `refs/shared/*`.
 - Review and merge must remain fail-closed.
 - Produce notifications only when there is actionable work; silent success is acceptable.
 
-## Current deployment
+## Deployment record
+
+Record the values your deployment produces:
 
 | Item | Value |
 |------|-------|
-| Reviewer principal | `principal_d2b928d116379e01` |
+| Reviewer principal | `<principal_...>` |
 | MCP endpoint | `http://127.0.0.1:18486/mcp` |
-| Project | `Archimedes` |
+| Project | `<project>` |
 | Protected ref | `refs/shared/main` |
 | Charon container | `charon-charon-1` |
 | Reviewer container | `charon-charon-reviewer-1` |
 | Lethe Git container | `lethe-git-local` |
-| Charon database backup | `/Users/michaelwyatt/.openclaw/workspace/backups/charon-lethe-git/charon-before-reviewer.db` |
-| Lethe Git database backup | `/Users/michaelwyatt/.openclaw/workspace/backups/charon-lethe-git/lethe-git-before-reviewer.db` |
-| Reviewer credential | `/Users/michaelwyatt/.openclaw/workspace/secrets/charon-local-reviewer.obol` (mode `0600`) |
-| OpenClaw MCP server | `charon-local-reviewer` in `/Users/michaelwyatt/.openclaw/openclaw.json` |
+| Charon database backup | `<backup-dir>/charon-before-<reason>.db` |
+| Lethe Git database backup | `<backup-dir>/lethe-git-before-<reason>.db` |
+| Reviewer credential | `secrets/reviewer-obol.txt` (mode `0600`) |
+| MCP client server entry | `<client-specific>` |

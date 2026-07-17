@@ -1,0 +1,11 @@
+# Gitleaks ignore list — reviewed fixtures only, NOT operational credentials.
+# Each line is an exact fingerprint (commit:path:rule:line). If any of these
+# lines shifts or a new secret appears in the same file, the scan flags it
+# again and forces explicit review. Do not add path- or rule-wide exemptions.
+#
+# internal/config/upstream_test.go — HMAC-key test constants (commit ddcb85a)
+ddcb85a1291b0a90b98194967d92fc0014061046:internal/config/upstream_test.go:generic-api-key:37
+ddcb85a1291b0a90b98194967d92fc0014061046:internal/config/upstream_test.go:generic-api-key:39
+ddcb85a1291b0a90b98194967d92fc0014061046:internal/config/upstream_test.go:generic-api-key:40
+# internal/upstream/lethe/mergeauth_conformance_test.go — merge-auth conformance fixture key (commit 758fb40)
+758fb400399463f4d285e340d93755d120921c0a:internal/upstream/lethe/mergeauth_conformance_test.go:generic-api-key:98
