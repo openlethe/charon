@@ -88,6 +88,9 @@ func runServe() error {
 	defer db.Close()
 
 	logger.Info("starting charon", "mode", cfg.Mode, "upstream", cfg.Upstream)
+	if cfg.AllowInsecureUpstream {
+		logger.Warn("development override CHARON_ALLOW_INSECURE_UPSTREAM=1: plaintext HTTP to a non-loopback Lethe endpoint exposes bearer credentials and merge authorizations; never use in production")
+	}
 
 	logOAuthConfiguration(logger, cfg)
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -17,6 +18,17 @@ type DB struct {
 	*sql.DB
 	dataDir string
 }
+
+// Durability policy (WP8): every client-visible success is fully durable on
+// commit — journal_mode=WAL with synchronous=FULL and foreign_keys enforced.
+// Acceptable data loss is zero for committed transactions; the RPO is the
+// transaction boundary. Storage must honor fsync (local disk or a volume
+// that does); network filesystems without fsync guarantees are unsupported.
+const (
+	defaultSynchronous    = "FULL"
+	defaultBusyTimeoutMS  = 5000
+	defaultAutoCheckpoint = 1000
+)
 
 // Open initializes the SQLite database with migrations.
 func Open(dataDir string) (*DB, error) {
@@ -40,7 +52,13 @@ func Open(dataDir string) (*DB, error) {
 	if err := os.Chmod(dbPath, 0600); err != nil {
 		return nil, fmt.Errorf("secure sqlite file: %w", err)
 	}
-	dsn := fmt.Sprintf("%s?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)", dbPath)
+	synchronous := envOr("CHARON_SQLITE_SYNCHRONOUS", defaultSynchronous)
+	dsn := fmt.Sprintf("%s?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(%s)&_pragma=synchronous(%s)&_pragma=wal_autocheckpoint(%s)",
+		dbPath,
+		envOr("CHARON_SQLITE_BUSY_TIMEOUT_MS", fmt.Sprintf("%d", defaultBusyTimeoutMS)),
+		synchronous,
+		envOr("CHARON_SQLITE_AUTOCHECKPOINT", fmt.Sprintf("%d", defaultAutoCheckpoint)),
+	)
 
 	sqlDB, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -48,6 +66,13 @@ func Open(dataDir string) (*DB, error) {
 	}
 
 	db := &DB{DB: sqlDB, dataDir: dataDir}
+	if err := db.verifyDurabilityPragmas(synchronous); err != nil {
+		verifyErr := fmt.Errorf("durability verification: %w", err)
+		if closeErr := sqlDB.Close(); closeErr != nil {
+			return nil, errors.Join(verifyErr, fmt.Errorf("close failed store: %w", closeErr))
+		}
+		return nil, verifyErr
+	}
 	if err := db.migrate(); err != nil {
 		migrationErr := fmt.Errorf("migrate: %w", err)
 		if closeErr := sqlDB.Close(); closeErr != nil {
@@ -57,6 +82,51 @@ func Open(dataDir string) (*DB, error) {
 	}
 
 	return db, nil
+}
+
+// verifyDurabilityPragmas fails closed when the storage engine did not apply
+// the required durability configuration, so an unsupported volume is detected
+// at startup rather than after data loss.
+func (db *DB) verifyDurabilityPragmas(wantSynchronous string) error {
+	var journalMode string
+	if err := db.QueryRow("PRAGMA journal_mode").Scan(&journalMode); err != nil {
+		return fmt.Errorf("read journal_mode: %w", err)
+	}
+	if !strings.EqualFold(journalMode, "wal") {
+		return fmt.Errorf("journal_mode = %s, want WAL", journalMode)
+	}
+	var synchronous int
+	if err := db.QueryRow("PRAGMA synchronous").Scan(&synchronous); err != nil {
+		return fmt.Errorf("read synchronous: %w", err)
+	}
+	wantSync := map[string]int{"OFF": 0, "NORMAL": 1, "FULL": 2, "EXTRA": 3}[strings.ToUpper(wantSynchronous)]
+	if synchronous != wantSync {
+		return fmt.Errorf("synchronous = %d, want %d (%s)", synchronous, wantSync, wantSynchronous)
+	}
+	var foreignKeys int
+	if err := db.QueryRow("PRAGMA foreign_keys").Scan(&foreignKeys); err != nil {
+		return fmt.Errorf("read foreign_keys: %w", err)
+	}
+	if foreignKeys != 1 {
+		return fmt.Errorf("foreign_keys not enforced")
+	}
+	return nil
+}
+
+// Close checkpoints the WAL (TRUNCATE) before closing so a clean shutdown
+// leaves a single database file and the next open starts without recovery.
+func (db *DB) Close() error {
+	// Best-effort checkpoint: an interrupted checkpoint does not lose data
+	// (WAL recovery on next open is correct), so only the close error counts.
+	_, _ = db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	return db.DB.Close()
+}
+
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }
 
 func (db *DB) migrate() error {

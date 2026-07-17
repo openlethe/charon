@@ -110,6 +110,11 @@ type Config struct {
 	// anchors every committed ledger tail for rollback detection.
 	LedgerAnchorPath string `env:"CHARON_LEDGER_ANCHOR_PATH"`
 
+	// AllowInsecureUpstream permits plaintext HTTP to a non-loopback Lethe
+	// endpoint. Development-only; production must use HTTPS, mTLS, a Unix
+	// socket, or a loopback endpoint. Always logged when set.
+	AllowInsecureUpstream bool `env:"CHARON_ALLOW_INSECURE_UPSTREAM" envDefault:"false"`
+
 	// MaxResultBytes caps MCP tool response sizes.
 	MaxResultBytes int `env:"CHARON_MAX_RESULT_BYTES" envDefault:"1048576"`
 
@@ -167,6 +172,10 @@ func FromEnv() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	allowInsecureUpstream, err := getEnvBool("CHARON_ALLOW_INSECURE_UPSTREAM", false)
+	if err != nil {
+		return nil, err
+	}
 	readHeaderTimeout, err := getEnvDuration("CHARON_HTTP_READ_HEADER_TIMEOUT", 10*time.Second, time.Second, time.Minute)
 	if err != nil {
 		return nil, err
@@ -211,6 +220,7 @@ func FromEnv() (*Config, error) {
 		LedgerHMACKey:              firstNonEmpty(os.Getenv("CHARON_LEDGER_HMAC_KEY"), os.Getenv("CHARON_HMAC_KEY")),
 		LedgerKeyID:                os.Getenv("CHARON_LEDGER_KEY_ID"),
 		LedgerAnchorPath:           os.Getenv("CHARON_LEDGER_ANCHOR_PATH"),
+		AllowInsecureUpstream:      allowInsecureUpstream,
 		MaxResultBytes:             maxResultBytes,
 		MaxResultCount:             maxResultCount,
 		MaxRequestBytes:            int64(maxRequestBytes),
@@ -229,7 +239,7 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("unsupported CHARON_MODE: %q (must be direct or memory-git)", cfg.Mode)
 	}
 
-	if err := validateHTTPURL(cfg.Upstream, false); err != nil {
+	if err := validateUpstreamTransport(cfg.Upstream, cfg.AllowInsecureUpstream); err != nil {
 		return nil, fmt.Errorf("invalid CHARON_UPSTREAM: %w", err)
 	}
 
@@ -339,6 +349,49 @@ func validateHTTPURL(raw string, requireHTTPS bool) error {
 		}
 	}
 	return nil
+}
+
+// validateUpstreamTransport enforces the production transport policy for the
+// Charon-to-Lethe channel: HTTPS (certificates and hostnames validated by the
+// Go stack), a Unix socket for local IPC, or loopback HTTP for development.
+// Plaintext HTTP to a non-loopback endpoint carries bearer credentials and
+// merge authorizations in the clear and is rejected unless the explicit
+// development-only override is set.
+func validateUpstreamTransport(raw string, allowInsecure bool) error {
+	if raw == "" {
+		return errors.New("URL is required")
+	}
+	if socketPath, isUnix := strings.CutPrefix(raw, "unix://"); isUnix {
+		if !strings.HasPrefix(socketPath, "/") {
+			return errors.New("unix:// upstream requires an absolute socket path")
+		}
+		return nil
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" {
+		return errors.New("must be an absolute URL")
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.EscapedPath() != "" {
+		return errors.New("userinfo, path, query, and fragment are not allowed")
+	}
+	switch parsed.Scheme {
+	case "https":
+		return nil
+	case "http":
+		host := parsed.Hostname()
+		if strings.EqualFold(host, "localhost") {
+			return nil
+		}
+		if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+			return nil
+		}
+		if allowInsecure {
+			return nil
+		}
+		return errors.New("plaintext HTTP to a non-loopback Lethe endpoint is not allowed in production; use HTTPS, a Unix socket, or loopback (CHARON_ALLOW_INSECURE_UPSTREAM=1 is a development-only override)")
+	default:
+		return errors.New("scheme must be http, https, or unix")
+	}
 }
 
 func generateOAuthPairingSecret() (string, error) {

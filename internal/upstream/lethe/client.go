@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -29,18 +31,32 @@ func (c *Client) SetMergeSigningKey(key string) {
 	c.mergeSigningKey = []byte(key)
 }
 
-// NewClient creates a Lethe client.
+// NewClient creates a Lethe client. A baseURL of the form unix:///absolute/
+// path.sock connects over a Unix domain socket — the supported local-IPC
+// transport for same-host deployments. http(s) URLs are used as-is; TLS
+// certificate and hostname validation is always on (Go defaults).
 func NewClient(baseURL, apiKey string, timeout time.Duration, maxBody int64) *Client {
-	return &Client{
-		baseURL: baseURL,
-		apiKey:  apiKey,
-		httpClient: &http.Client{
-			Timeout: timeout,
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
+	httpClient := &http.Client{
+		Timeout: timeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
 		},
-		maxBody: maxBody,
+	}
+	if socketPath, isUnix := strings.CutPrefix(baseURL, "unix://"); isUnix {
+		httpClient.Transport = &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{Timeout: timeout}).DialContext(ctx, "unix", socketPath)
+			},
+		}
+		// Requests need an absolute URL; the host is a placeholder because the
+		// transport always dials the socket.
+		baseURL = "http://lethe.unix"
+	}
+	return &Client{
+		baseURL:    baseURL,
+		apiKey:     apiKey,
+		httpClient: httpClient,
+		maxBody:    maxBody,
 	}
 }
 
