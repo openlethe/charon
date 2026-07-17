@@ -6,6 +6,7 @@ All notable changes to Charon are documented here. The project follows semantic 
 
 ### Security
 
+- Mirror Lethe's bounded, closed, unambiguous semantic-operation contract in the MCP typed parser: per-op payload size caps, closed per-op payload key sets, and ambiguous-identifier rejection before any upstream side effect; accept target-less merge/review attestations only with a summary and provenance marker.
 - Require an authorization key before OAuth authorization codes can be issued, generate a fresh high-entropy key for each primary Compose process start, and display the exact client, callback destination, and protected resource on the consent page.
 - Fail closed instead of marking legacy proposals approved with a placeholder event ID when Lethe cannot provide idempotent event materialization.
 - Require `response_type=code` and S256 PKCE for public browser authorization flows.
