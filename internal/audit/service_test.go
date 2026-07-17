@@ -161,7 +161,11 @@ func TestReconcileSkipsLiveSiblings(t *testing.T) {
 	if _, err := restarting.RegisterInstance(ctx); err != nil {
 		t.Fatal(err)
 	}
-	reconciled, err := restarting.ReconcileAfterRestart(ctx, time.Millisecond)
+	// The TTL must exceed any scheduling delay between the sibling's
+	// heartbeat and this call (the race detector stretches that window past
+	// 1ms deterministically); the dead owner is unregistered, so it
+	// reconciles under any TTL.
+	reconciled, err := restarting.ReconcileAfterRestart(ctx, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
