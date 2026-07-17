@@ -100,6 +100,60 @@ Prerequisite: a reachable Lethe instance. For Memory Git mode, run Lethe in
 `git` mode on port 18485 (see the Lethe repository's `docker-compose.git.yml`)
 and point `CHARON_UPSTREAM` at it.
 
+### 1. Configure `.env` manually (no scripts required)
+
+Copy `.env.example` to `.env` and replace the placeholders, or write the file
+from scratch — every value is operator-generated. A complete manual `.env`
+looks like this:
+
+```bash
+# ── Required ──────────────────────────────────────────────
+# Must match the key the upstream Lethe was started with.
+LETHE_API_KEY=replace-with-upstream-lethe-api-key
+
+# Three distinct signing keys. Generate each independently:
+#   openssl rand -hex 32
+# Never reuse one value across purposes; leave legacy CHARON_HMAC_KEY unset.
+CHARON_OBOL_HMAC_KEY=replace-with-random-64-hex
+CHARON_OAUTH_HMAC_KEY=replace-with-random-64-hex
+
+# Must ALSO be configured on Lethe with the identical value — it signs and
+# verifies the memory-git-merge/v2 merge envelopes.
+CHARON_MERGE_HMAC_KEY=replace-with-random-64-hex
+
+# Public URL of this gateway — credential audience + OAuth metadata.
+CHARON_PUBLIC_URL=https://charon.example.com
+
+# OAuth client configuration (browser-flow clients such as ChatGPT).
+CHARON_OAUTH_CLIENT_ID=chatgpt-mcp
+CHARON_OAUTH_REDIRECT_URIS=https://chatgpt.com/connector/oauth/*
+# Principal (ID or unique name) the OAuth flow issues tokens for. Leave
+# blank until after `charon principal reconcile`, then fill it in.
+CHARON_OAUTH_DEFAULT_USER=
+
+# ── Defaults you can keep ─────────────────────────────────
+CHARON_MODE=memory-git
+CHARON_AUTH_MODE=oauth
+# Plaintext HTTP to a non-loopback upstream is refused; the documented
+# local Docker Desktop gateway is the one allowed exception.
+# CHARON_UPSTREAM=http://host.docker.internal:18485
+# CHARON_ALLOW_INSECURE_UPSTREAM=1
+
+# ── Optional ──────────────────────────────────────────────
+# CHARON_OAUTH_GENERATE_PAIRING_SECRET=true   # fresh browser pairing key on every start (default in Compose)
+# CHARON_OAUTH_ALLOW_AUTHOR_SCOPES=false      # keep OAuth tokens read/propose-only
+# CHARON_AUTO_USER=chatgpt                    # auto-bootstrap a principal + token on first start
+# CHARON_AUTO_PERMISSION=readonly             # readonly | propose | review | write
+# CHARON_AUTO_PROJECTS=*
+# CHARON_LEDGER_HMAC_KEY=                     # purpose-specific ledger signing key (recommended)
+# CHARON_LEDGER_ANCHOR_PATH=./data/ledger-anchor.jsonl
+# CHARON_MERGE_AUTH_TTL=2m                    # envelope lifetime (hard cap 15m)
+# CHARON_RECOVERY_READONLY=false              # set true after a restore until reconcile passes
+```
+
+The full annotated reference is `.env.example`. After editing:
+`chmod 600 .env` and never commit it — `.gitignore` already covers it.
+
 ```bash
 export CHARON_HTTP=":18484"
 export CHARON_ADMIN_HTTP="127.0.0.1:18486"
@@ -116,7 +170,17 @@ export CHARON_MERGE_HMAC_KEY="$(openssl rand -hex 32)"
 export CHARON_DATA_DIR="./data"
 ```
 
-### 2. Build and Run
+### 2. Run with Docker (pulls the published image)
+
+The Compose stack pulls `ghcr.io/openlethe/charon:latest` — no local build:
+
+```bash
+docker compose up -d          # primary OAuth gateway on 127.0.0.1:18484
+                              # reviewer Obol gateway on 127.0.0.1:18486
+```
+
+The `charon-data` named volume is created automatically on first start and
+holds the policy database. To build from source instead:
 
 ```bash
 make build

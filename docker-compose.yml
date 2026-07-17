@@ -1,8 +1,6 @@
 services:
   charon:
-    build:
-      context: .
-    image: charon:local
+    image: ghcr.io/openlethe/charon:latest
     restart: unless-stopped
     init: true
     environment:
@@ -66,9 +64,7 @@ services:
       start_period: 10s
 
   charon-reviewer:
-    build:
-      context: .
-    image: charon:local
+    image: ghcr.io/openlethe/charon:latest
     restart: unless-stopped
     init: true
     depends_on:
