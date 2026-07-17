@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/openlethe/charon/internal/config"
 	"github.com/openlethe/charon/internal/reconcile"
 )
 
@@ -48,11 +49,15 @@ func runReconcile() error {
 		fmt.Println("manifest check: OK (databases match the backup set)")
 	}
 
+	cfg, err := config.FromEnv()
+	if err != nil {
+		return fmt.Errorf("config: %w", err)
+	}
 	report, err := reconcile.Reconcile(ctx, charonDB, letheDB)
 	if err != nil {
 		return err
 	}
-	if err := reconcile.VerifyLocal(ctx, charonData, anchor, report); err != nil {
+	if err := reconcile.VerifyLocal(ctx, charonData, anchor, cfg.LedgerKey(), cfg.LedgerKeyID, report); err != nil {
 		return err
 	}
 	data, _ := json.MarshalIndent(report, "", "  ")

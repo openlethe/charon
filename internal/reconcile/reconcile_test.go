@@ -284,7 +284,7 @@ func TestReconcileWarnsOnStalePendingMerge(t *testing.T) {
 func TestVerifyLocalRunsIntegrityChecks(t *testing.T) {
 	dir := t.TempDir()
 	report := &Report{StartedAt: time.Now().UTC(), Clean: true, Findings: []Finding{}}
-	if err := VerifyLocal(context.Background(), dir, "", report); err != nil {
+	if err := VerifyLocal(context.Background(), dir, "", "", "", report); err != nil {
 		t.Fatal(err)
 	}
 	if !report.Clean {

@@ -180,6 +180,10 @@ func FromEnv() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	recoveryReadOnly, err := getEnvBool("CHARON_RECOVERY_READONLY", false)
+	if err != nil {
+		return nil, err
+	}
 	readHeaderTimeout, err := getEnvDuration("CHARON_HTTP_READ_HEADER_TIMEOUT", 10*time.Second, time.Second, time.Minute)
 	if err != nil {
 		return nil, err
@@ -225,7 +229,7 @@ func FromEnv() (*Config, error) {
 		LedgerKeyID:                os.Getenv("CHARON_LEDGER_KEY_ID"),
 		LedgerAnchorPath:           os.Getenv("CHARON_LEDGER_ANCHOR_PATH"),
 		AllowInsecureUpstream:      allowInsecureUpstream,
-		RecoveryReadOnly:           getEnvStringBool("CHARON_RECOVERY_READONLY"),
+		RecoveryReadOnly:           recoveryReadOnly,
 		MaxResultBytes:             maxResultBytes,
 		MaxResultCount:             maxResultCount,
 		MaxRequestBytes:            int64(maxRequestBytes),
@@ -424,14 +428,6 @@ func (c *Config) MergeKey() string { return firstNonEmpty(c.MergeHMACKey, c.HMAC
 
 // LedgerKey returns the purpose-specific ledger key or the legacy fallback.
 func (c *Config) LedgerKey() string { return firstNonEmpty(c.LedgerHMACKey, c.HMACKey) }
-
-// getEnvStringBool reads a boolean env var, defaulting to false on absence or
-// unparseable values; used for operator kill-switches that must never block
-// startup on a typo.
-func getEnvStringBool(key string) bool {
-	v, _ := getEnvBool(key, false)
-	return v
-}
 
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {

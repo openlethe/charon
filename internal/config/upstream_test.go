@@ -29,3 +29,29 @@ func TestValidateUpstreamTransport(t *testing.T) {
 		}
 	}
 }
+
+func TestRecoveryReadOnlyStrictParsing(t *testing.T) {
+	t.Setenv("CHARON_MODE", "memory-git")
+	t.Setenv("CHARON_PUBLIC_URL", "https://charon.example.test")
+	t.Setenv("CHARON_OAUTH_REDIRECT_URIS", "https://chatgpt.com/connector/oauth/*")
+	t.Setenv("CHARON_OAUTH_PAIRING_SECRET", "0123456789abcdef0123456789abcdef")
+	t.Setenv("LETHE_API_KEY", "key")
+	t.Setenv("CHARON_OBOL_HMAC_KEY", "0123456789abcdef0123456789abcdef")
+	t.Setenv("CHARON_MERGE_HMAC_KEY", "0123456789abcdef0123456789abcdef")
+	t.Setenv("CHARON_AUTH_MODE", "obol")
+	t.Setenv("CHARON_OAUTH_DEFAULT_USER", "principal")
+
+	// Invalid values fail closed instead of silently disabling the switch.
+	t.Setenv("CHARON_RECOVERY_READONLY", "yes")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("invalid recovery read-only value accepted")
+	}
+	t.Setenv("CHARON_RECOVERY_READONLY", "true")
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.RecoveryReadOnly {
+		t.Fatal("recovery read-only not parsed")
+	}
+}

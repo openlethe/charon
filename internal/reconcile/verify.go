@@ -13,9 +13,12 @@ import (
 )
 
 // VerifyLocal checks Charon's own integrity controls on a restored database:
-// the ledger hash chain and MACs, the external anchor, every proposal state
-// digest, and the audit outbox backlog. Findings are added to the report.
-func VerifyLocal(ctx context.Context, charonDataDir, anchorPath string, report *Report) error {
+// the ledger hash chain and keyed MACs, the external anchor, every proposal
+// state digest, and the audit outbox backlog. The ledger key must be the same
+// one the deployment uses, or MACed rows fail closed here — an unkeyed
+// verification would wave through recomputed hash chains. Findings are added
+// to the report.
+func VerifyLocal(ctx context.Context, charonDataDir, anchorPath, ledgerKey, ledgerKeyID string, report *Report) error {
 	db, err := store.Open(charonDataDir)
 	if err != nil {
 		return fmt.Errorf("open charon store: %w", err)
@@ -23,6 +26,9 @@ func VerifyLocal(ctx context.Context, charonDataDir, anchorPath string, report *
 	defer db.Close()
 
 	ledgerSvc := ledger.NewService(db)
+	if len(ledgerKey) >= 32 {
+		ledgerSvc.SetIntegrityKey([]byte(ledgerKey), ledgerKeyID)
+	}
 	ledgerSvc.SetAnchorPath(anchorPath)
 	if _, err := ledgerSvc.Verify(ctx); err != nil {
 		report.add("ledger-chain", "error", fmt.Sprintf("ledger chain verification failed: %v", err))
