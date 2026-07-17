@@ -433,3 +433,80 @@ migration, Cloudflare tunnel-token rotation verification, ChatGPT connector
 reauthorization, live Lethe log reconciliation, the post-rebuild credentialed
 Memory Git E2E, and unavailable `staticcheck`, `govulncheck`, and `actionlint`
 executables. No remote action was performed.
+
+## Production-remediation sprint — 2026-07-16
+
+Independent production-readiness audit findings (CHARON_LETHE_PRODUCTION_REMEDIATION_HANDOFF.md)
+remediated on the `remediation/memory-git-local` branch. Every work package
+ships with regression tests; all local gates pass (gofmt, vet, staticcheck,
+race tests, gosec, govulncheck — 0 affecting vulnerabilities).
+
+### Correctness and integrity (WP1–WP5)
+
+- Conflict analysis is pure; conflicts persist only bound to proposals with
+  deterministic identity and a complete lifecycle
+  (`open|resolved|rejected|superseded|canceled|deferred`). Cancel/reject
+  retires; landed merges supersede; accepted context exposes only open,
+  head-relevant conflicts.
+- Merge-proposal creation is atomically idempotent: proposal row + canonical
+  request digest + idempotency record commit in one transaction. Exact replay
+  returns the original; same-key different-body fails closed.
+- Persisted proposal state fails closed on any corruption (JSON, timestamps,
+  invalid values); a canonical proposal-state digest is recomputed on every
+  mutation and verified on every load; legacy rows migrate via startup
+  backfill or are quarantined.
+- Memory Git writes use strict typed parsing: unknown fields and malformed
+  elements reject the whole request before any side effect; operation count
+  and order are preserved exactly.
+- Lethe enforces versioned (memory_git/v1) semantic validation for every
+  operation before immutable history: content/kind/visibility/confidence/tags
+  invariants, target existence and identity collisions against sequentially
+  applied parent state, trust transitions, self-relation and self-supersede
+  bans, attestation-marker provenance, cross-project rejection.
+
+### Authorization, audit, and durability (WP6–WP9)
+
+- Protected-merge authorization is a versioned, expiring, single-use envelope
+  (memory-git-merge/v2) bound to the exact merge fields and proposal-state
+  digest, with key IDs and rotation overlap; Lethe consumes the nonce
+  atomically with the CAS, enforces merge shape, and records a durable
+  advancement record. Generic-key fallback formally deprecated.
+- Every security-relevant mutation records a durable audit intent before its
+  side effect and completes/fails/marks-ambiguous after; mutations fail
+  closed when audit persistence is unavailable; restart reconciliation marks
+  stranded intents ambiguous. Ledger entries carry purpose-specific HMAC MACs
+  with key rotation; an external append-only anchor detects wholesale chain
+  replacement.
+- Both stores run WAL + synchronous=FULL + foreign_keys with startup
+  verification (fail closed on unsupported storage) and checkpoint-on-close;
+  abrupt-kill survival is tested.
+- Loopback-only trust is the default; non-loopback binds require API keys;
+  Charon-to-Lethe requires HTTPS, a Unix socket, or loopback HTTP (dev
+  override is explicit and logged); bearer secrets never appear in errors.
+
+### Scale, recovery, and observability (WP10–WP12)
+
+- Historical reconstruction uses a bulk loader (recursive-CTE skeleton with
+  O(n) primary-key lookups, batched loads, iterative exact DFS post-order
+  proven identical to the legacy recursive traversal on random DAGs),
+  one-traversal reachability+reconstruction, batched source-event resolution,
+  and a configurable fail-closed history limit. Benchmarks: 1k ≈ 13ms,
+  10k ≈ 140ms, 100k ≈ 1.6s (was 65s at 10k before the O(n) fix).
+- Coordinated backup/restore: `charon backup` manifests both databases;
+  `charon reconcile` + `lethe verify-chain` validate restores; recovery
+  read-only modes block mutations until reconciliation passes.
+- Prometheus-text metrics on both services (Charon `/admin/metrics`, Lethe
+  `/api/metrics`), liveness/readiness split, and documented SLOs, alert
+  thresholds, and runbooks in `docs/observability.md`.
+
+### Remaining risks and follow-ups
+
+- Remote CI evidence, signed/attested container images, SBOM, and provenance
+  require pushing to a remote with CI (Charon currently has no git remote).
+- The destructive end-to-end matrix (container kills, host restarts, disk
+  full) is partially covered by unit-level fault tests; full drills need an
+  isolated environment.
+- `mTLS` for Charon-to-Lethe is not implemented; HTTPS or Unix socket are the
+  supported production transports.
+- OAuth pairing/connector reauthorization and live tunnel verification remain
+  operator tasks from earlier phases.

@@ -34,6 +34,7 @@ func BackfillStateDigests(ctx context.Context, db *store.DB) (int, int, error) {
 		proposals = append(proposals, p)
 	}
 	if err := rows.Err(); err != nil {
+		// #nosec G104 -- already returning the scan error; Close failure is immaterial.
 		rows.Close()
 		return 0, 0, fmt.Errorf("backfill scan: %w", err)
 	}
