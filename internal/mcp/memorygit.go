@@ -664,8 +664,11 @@ func (s *Server) handleMemoryMergePropose(ctx context.Context, request mcp.CallT
 			}
 		}
 		if len(persistSet) > 0 {
+			// The proposal is durably committed, so a conflict-persistence
+			// failure is an ambiguous cross-service outcome, not a failure of
+			// the mutation itself.
 			if err := s.lethe.PersistConflicts(ctx, project, prop.ID, persistSet); err != nil {
-				s.finishAudit(intent, err)
+				s.finishAuditAmbiguous(intent, err)
 				s.recordLedger(reqID, principal, "memory_merge_propose", []string{project}, "error: conflict persistence failed", time.Since(start))
 				return nil, fmt.Errorf("persist proposal conflicts: %w", err)
 			}
