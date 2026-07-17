@@ -122,20 +122,20 @@ if [[ -z ${CHARON_OAUTH_DEFAULT_USER:-} ]]; then
     set_env_value CHARON_OAUTH_DEFAULT_USER "$author_id"
 fi
 
+# Obols are audience-bound to the public URL of the gateway that mints them.
+# The primary gateway serves OAuth only; the reviewer gateway is this
+# deployment's Obol listener (127.0.0.1:18486), so every local-agent Obol is
+# minted through it. A token minted with the primary gateway's audience would
+# be rejected by every Obol listener in the deployment.
 mint_to_file() {
     local principal_id=$1
     local destination=$2
-    local gateway=${3:-primary}
-    if [[ "$gateway" == reviewer ]]; then
-        "${reviewer_cli[@]}" obol mint --expires 7d "$principal_id" > "$destination"
-    else
-        "${charon_cli[@]}" obol mint --expires 7d "$principal_id" > "$destination"
-    fi
+    "${reviewer_cli[@]}" obol mint --expires 7d "$principal_id" > "$destination"
     chmod 600 "$destination"
 }
 
 mint_to_file "$author_id" "${secrets_dir}/author-obol.txt"
-mint_to_file "$reviewer_id" "${secrets_dir}/reviewer-obol.txt" reviewer
+mint_to_file "$reviewer_id" "${secrets_dir}/reviewer-obol.txt"
 mint_to_file "$reader_id" "${secrets_dir}/reader-obol.txt"
 
 cat > "${secrets_dir}/principal-ids.txt" <<EOF
