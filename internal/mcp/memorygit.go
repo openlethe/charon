@@ -950,9 +950,12 @@ func (s *Server) handleMemoryMerge(ctx context.Context, request mcp.CallToolRequ
 			if blocking {
 				return nil, fmt.Errorf("merge has unresolved conflicts: %s", strings.Join(ids, ","))
 			}
+			// Target-less merge attestation: valid under memory_git/v1 because it
+			// carries a human-readable summary plus provenance (proposal and
+			// source changeset) — the only shape Lethe accepts without a target.
 			mergeOp := lethe.SemanticOp{OpType: "attach_verification", Payload: map[string]interface{}{
-				"kind": "reviewed_merge", "proposal_id": p.ID,
-				"source_changeset_id": p.HeadChangesetID,
+				"kind": "reviewed_merge", "summary": "reviewed merge proposal " + p.ID,
+				"proposal_id": p.ID, "source_changeset_id": p.HeadChangesetID,
 			}}
 			merged, err := s.lethe.CreateChangeset(ctx, lethe.CreateChangesetRequest{
 				ProjectID: p.ProjectID, RefName: p.TargetRef,

@@ -438,6 +438,12 @@ func runLedger() error {
 	defer db.Close()
 
 	ledgerSvc := ledger.NewService(db)
+	// Verify with the same integrity configuration as the server: keyed MACs
+	// and the external anchor, or the checks are silently weaker.
+	if key := cfg.LedgerKey(); len(key) >= 32 {
+		ledgerSvc.SetIntegrityKey([]byte(key), cfg.LedgerKeyID)
+	}
+	ledgerSvc.SetAnchorPath(cfg.LedgerAnchorPath)
 
 	switch sub {
 	case "tail":
@@ -458,9 +464,18 @@ func runLedger() error {
 	case "verify":
 		count, err := ledgerSvc.Verify(ctx)
 		if err != nil {
-			return err
+			return fmt.Errorf("ledger chain verification failed: %w", err)
 		}
-		fmt.Printf("Ledger verified: %d entries\n", count)
+		fmt.Printf("Ledger verified: %d entries (hash chain + entry MACs)\n", count)
+		if cfg.LedgerAnchorPath != "" {
+			matched, err := ledgerSvc.VerifyAnchor(ctx)
+			if err != nil {
+				return fmt.Errorf("ledger anchor verification failed: %w", err)
+			}
+			fmt.Printf("Anchor verified: %d tail entries match %s\n", matched, cfg.LedgerAnchorPath)
+		} else {
+			fmt.Println("note: CHARON_LEDGER_ANCHOR_PATH unset; wholesale-replacement detection unavailable")
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown ledger subcommand: %s\n", sub)
 		os.Exit(1)
