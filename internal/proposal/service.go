@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/openlethe/charon/internal/metrics"
 	"github.com/openlethe/charon/internal/store"
 	"github.com/openlethe/charon/internal/upstream/lethe"
 )
@@ -334,6 +335,7 @@ func (s *Service) CreateIdempotent(ctx context.Context, req CreateRequest, diges
 	if err := tx.Commit(); err != nil {
 		return nil, false, fmt.Errorf("commit proposal idempotency transaction: %w", err)
 	}
+	metrics.Inc(metrics.ProposalCreated)
 	return p, false, nil
 }
 
@@ -341,8 +343,10 @@ func (s *Service) CreateIdempotent(ctx context.Context, req CreateRequest, diges
 // returned only when its recorded request digest equals the replay's digest.
 func matchReplay(existing *Proposal, requestDigest, key string) (*Proposal, bool, error) {
 	if existing.RequestDigest == "" || existing.RequestDigest != requestDigest {
+		metrics.Inc(metrics.IdempotencyMismatches)
 		return nil, false, fmt.Errorf("%w: key %s", ErrIdempotencyMismatch, key)
 	}
+	metrics.Inc(metrics.IdempotentReplays)
 	return existing, true, nil
 }
 

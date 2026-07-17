@@ -20,6 +20,7 @@ import (
 	"github.com/openlethe/charon/internal/idempotency"
 	"github.com/openlethe/charon/internal/ledger"
 	"github.com/openlethe/charon/internal/mcp"
+	"github.com/openlethe/charon/internal/metrics"
 	"github.com/openlethe/charon/internal/oauth"
 	"github.com/openlethe/charon/internal/obol"
 	"github.com/openlethe/charon/internal/proposal"
@@ -35,6 +36,7 @@ type Server struct {
 	oauthSvc                *oauth.Service
 	oauthDefaultPrincipalID string
 	ledgerSvc               *ledger.Service
+	auditSvc                *audit.Service
 	lethe                   *lethe.Client
 	mcpServer               *mcp.Server
 	logger                  *slog.Logger
@@ -94,6 +96,7 @@ func NewServer(cfg *config.Config, db *store.DB, logger *slog.Logger) (*Server, 
 		obolSvc:   obolSvc,
 		oauthSvc:  oauthSvc,
 		ledgerSvc: ledgerSvc,
+		auditSvc:  auditSvc,
 		lethe:     letheClient,
 		mcpServer: mcpServer,
 		logger:    logger,
@@ -148,6 +151,7 @@ func (s *Server) Start(ctx context.Context) error {
 	adminMux.HandleFunc("/admin/livez", s.handleLiveness)
 	adminMux.HandleFunc("/admin/readyz", s.handleReadiness)
 	adminMux.HandleFunc("/admin/health", s.handleReadiness)
+	adminMux.HandleFunc("/admin/metrics", s.handleMetrics)
 
 	publicListener, err := net.Listen("tcp", s.cfg.HTTP)
 	if err != nil {
@@ -562,16 +566,35 @@ func (s *Server) handleLiveness(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(`{"status":"alive"}`))
 }
 
+// handleReadiness distinguishes readiness from liveness: the store must
+// answer and the upstream must be reachable.
 func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	if err := s.db.PingContext(r.Context()); err != nil {
+		s.logger.Warn("store readiness check failed", "error", sanitizeHealthError(err))
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"status":"unavailable","cause":"store"}`))
+		return
+	}
 	if err := s.lethe.Health(r.Context()); err != nil {
 		s.logger.Warn("upstream Lethe readiness check failed", "error", sanitizeHealthError(err))
 		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte(`{"status":"unavailable"}`))
+		_, _ = w.Write([]byte(`{"status":"unavailable","cause":"upstream"}`))
 		return
 	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(`{"status":"ready"}`))
+}
+
+// handleMetrics exposes the in-process registry in Prometheus text format on
+// the loopback-only admin listener.
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	// Refresh point-in-time gauges at scrape time.
+	if backlog, err := s.auditSvc.Backlog(r.Context()); err == nil {
+		metrics.SetGauge(metrics.AuditOutboxBacklog, int64(backlog))
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	_, _ = w.Write([]byte(metrics.Expose()))
 }
 
 func scopeSet(scopes []string) map[string]struct{} {

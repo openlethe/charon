@@ -18,6 +18,7 @@ import (
 	"github.com/openlethe/charon/internal/config"
 	"github.com/openlethe/charon/internal/idempotency"
 	"github.com/openlethe/charon/internal/ledger"
+	"github.com/openlethe/charon/internal/metrics"
 	"github.com/openlethe/charon/internal/policy"
 	"github.com/openlethe/charon/internal/proposal"
 	"github.com/openlethe/charon/internal/upstream/lethe"
@@ -199,8 +200,10 @@ func (s *Server) checkIdempotency(ctx context.Context, principalID, operation, k
 	}
 	if check.Found {
 		if !check.Matching {
+			metrics.Inc(metrics.IdempotencyMismatches)
 			return nil, fmt.Errorf("idempotency key exists with different input")
 		}
+		metrics.Inc(metrics.IdempotentReplays)
 		return check.Record, nil
 	}
 	return nil, nil // not found
@@ -864,12 +867,16 @@ func (s *Server) recordLedger(reqID string, principal auth.Principal, operation 
 		Result:      result,
 		Latency:     latency,
 	}); err != nil {
+		metrics.Inc(metrics.LedgerAppendFailures)
 		slog.Error("audit ledger write failed",
 			"request_id", reqID,
 			"principal", principal.ID,
 			"operation", operation,
 			"error", sanitizeError(err),
 		)
+	}
+	if strings.HasPrefix(result, "denied:") {
+		metrics.Inc(metrics.AuthzDenials)
 	}
 }
 
@@ -929,6 +936,7 @@ func (s *Server) finishAudit(intent *audit.Intent, opErr error) {
 		err = s.audit.Fail(ctx, intent.IntentID, sanitizeError(opErr))
 	}
 	if err != nil {
+		metrics.Inc(metrics.AuditAppendFailures)
 		slog.Error("audit outcome write failed; intent stranded for restart reconciliation",
 			"intent_id", intent.IntentID,
 			"operation", intent.Operation,

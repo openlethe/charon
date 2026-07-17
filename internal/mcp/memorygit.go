@@ -11,6 +11,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/openlethe/charon/internal/auth"
 	"github.com/openlethe/charon/internal/canonical"
+	"github.com/openlethe/charon/internal/metrics"
 	"github.com/openlethe/charon/internal/policy"
 	"github.com/openlethe/charon/internal/proposal"
 	"github.com/openlethe/charon/internal/upstream/lethe"
@@ -404,6 +405,7 @@ func (s *Server) handleMemoryChangesetCreate(ctx context.Context, request mcp.Ca
 	// stored idempotency record.
 	typed, err := parseChangesetCreateArgs(args)
 	if err != nil {
+		metrics.Inc(metrics.StrictParsingRejections)
 		s.recordLedger(reqID, principal, "memory_changeset_create", []string{project}, "rejected: malformed request", time.Since(start))
 		return nil, fmt.Errorf("invalid changeset request: %w", err)
 	}
@@ -530,6 +532,7 @@ func (s *Server) handleMemoryMergePropose(ctx context.Context, request mcp.CallT
 	}
 	typed, err := parseMergeProposeArgs(args)
 	if err != nil {
+		metrics.Inc(metrics.StrictParsingRejections)
 		s.recordLedger(reqID, principal, "memory_merge_propose", []string{project}, "rejected: malformed request", time.Since(start))
 		return nil, fmt.Errorf("invalid merge proposal request: %w", err)
 	}
@@ -809,6 +812,7 @@ func (s *Server) handleMemoryMerge(ctx context.Context, request mcp.CallToolRequ
 	if !approved {
 		return nil, fmt.Errorf("merge proposal has no current independent approval for the target head")
 	}
+	metrics.Inc(metrics.MergeAttempts)
 	head, err := s.lethe.GetChangeset(ctx, p.HeadChangesetID)
 	if err != nil || head.ProjectID != p.ProjectID {
 		return nil, fmt.Errorf("merge head is unavailable or crossed project boundary")
@@ -1001,6 +1005,9 @@ func (s *Server) advanceProtectedMerge(ctx context.Context, p *proposal.Proposal
 		MergeProposalID: p.ID, ReviewerPrincipal: reviewer,
 		ProposalDigest: p.StateDigest, MergerPrincipal: merger, Strategy: strategy,
 	})
+	if err != nil && strings.Contains(err.Error(), "409") {
+		metrics.Inc(metrics.MergeCASConflicts)
+	}
 	return err
 }
 
