@@ -2,7 +2,7 @@
 
 > Lethe remembers. Charon carries.
 
-Charon is a self-hosted MCP policy gateway for [Lethe](https://github.com/openlethe/lethe). It provides scoped, auditable access to Lethe memory for AI clients while keeping Lethe private.
+Charon is the MCP authorization and governance gateway for [Lethe](https://github.com/openlethe/lethe). It controls project scopes, proposals, review, protected merges, credentials, and audit behavior while keeping Lethe private. Charon requires a reachable Lethe instance; ChatGPT, Claude, and other MCP clients connect to Charon, never to Lethe directly.
 
 Charon defaults to `CHARON_MODE=memory-git`, which registers only versioned
 branch, changeset, context, review, and merge tools. The original mutable event
@@ -11,23 +11,50 @@ compatibility setting.
 
 ## Architecture
 
-```
-MCP Client (ChatGPT, Claude, etc.)
-  |
-  | HTTPS
-  v
-Cloudflare Tunnel / cloudflared
-  |
-  | HTTP
-  v
-Charon (MCP policy + Memory Git workflow)
-  |
-  | Private local network
-  v
-Lethe Git (git mode, port 18485, isolated SQLite)
+```text
+ChatGPT / Claude / Generic MCP Client
+                |
+                | OAuth or Obol-authenticated MCP
+                v
+             Charon
+   authorization / policy / review
+                |
+                | private typed API
+                v
+              Lethe
+     canonical persistent memory
 
-OpenClaw ──> OpenLethe (legacy mode, port 18483, existing SQLite)
+OpenClaw
+   |
+   | optional automatic context integration
+   v
+Lethe OpenClaw Plugin
 ```
+
+The OpenClaw plugin is optional and does not replace Charon: generic MCP
+clients use the full Memory Git workflow by calling Charon's tools explicitly.
+A typical deployment fronts Charon with Cloudflare Tunnel over HTTPS while
+Lethe Git (port 18485, isolated SQLite) stays on the private network; OpenClaw
+keeps using OpenLethe (legacy mode, port 18483) separately.
+
+## Compatibility
+
+| Component | Release |
+|---|---|
+| Charon | `v0.1.0-beta.1` |
+| Lethe | `v0.4.0-beta.1` |
+| Memory Git schema | `memory_git/v1` |
+| Merge authorization | `memory-git-merge/v2` |
+| Lethe OpenClaw plugin | matching Lethe release |
+
+Canonical default ports:
+
+| Service | Default |
+|---|---:|
+| Legacy/OpenClaw Lethe | `18483` |
+| Charon MCP | `18484` |
+| Lethe Git | `18485` |
+| Charon reviewer | `18486` |
 
 ## MCP Tools
 
@@ -69,6 +96,10 @@ rejected but are not falsely reported as materialized.
 
 ## Quick start
 
+Prerequisite: a reachable Lethe instance. For Memory Git mode, run Lethe in
+`git` mode on port 18485 (see the Lethe repository's `docker-compose.git.yml`)
+and point `CHARON_UPSTREAM` at it.
+
 ```bash
 export CHARON_HTTP=":18484"
 export CHARON_ADMIN_HTTP="127.0.0.1:18486"
@@ -79,8 +110,9 @@ export LETHE_API_KEY="your-lethe-api-key"
 export CHARON_OBOL_HMAC_KEY="$(openssl rand -hex 32)"
 export CHARON_OAUTH_HMAC_KEY="$(openssl rand -hex 32)"
 export CHARON_MERGE_HMAC_KEY="$(openssl rand -hex 32)"
-# Configure CHARON_MERGE_HMAC_KEY on trusted Lethe as CHARON_HMAC_KEY so
-# protected merge signatures can be verified. Keep all three values distinct.
+# Configure the same value on trusted Lethe as CHARON_MERGE_HMAC_KEY
+# (CHARON_HMAC_KEY accepted as a legacy fallback) so protected merge
+# signatures can be verified. Keep all three values distinct.
 export CHARON_DATA_DIR="./data"
 ```
 
@@ -126,6 +158,23 @@ created under `dist/` and published by the release workflow.
 curl -H "Authorization: Bearer obol_..._..." \
      http://localhost:18484/mcp
 ```
+
+## Independent review path
+
+Memory Git changes reach protected refs only through independent review:
+
+1. An author principal (exact project grant plus branch/commit scopes)
+   commits a changeset to an owned branch ref with `memory_changeset_create`
+   and opens a proposal with `memory_merge_propose`.
+2. A separate reviewer principal (review/merge authority, no direct write)
+   records an explicit approve, request-changes, or reject verdict with
+   `memory_merge_review`, bound to the exact proposal snapshot reviewed.
+3. Only a currently approved proposal can be applied with `memory_merge`;
+   review findings against a stale or mutated proposal fail closed.
+
+Author and reviewer principals are distinct credentials (see quick start step
+3), so no single principal can both propose and approve the same protected
+merge.
 
 ## CLI Commands
 
@@ -201,6 +250,15 @@ connectors must refresh or reconnect after upgrading so they retrieve the new
 `memory_merge_review` contract, and OAuth clients must complete a new paired
 authorization if their existing token is no longer accepted.
 
+## Optional OpenClaw integration
+
+The Lethe OpenClaw plugin is optional. It automatically retrieves and injects
+accepted memory into OpenClaw conversations and records context metadata.
+Charon and Lethe work without it: ChatGPT, Claude, and other MCP clients use
+Charon's Memory Git tools directly. Install the plugin from ClawHub when an
+OpenClaw agent should receive accepted memory automatically instead of calling
+MCP tools explicitly.
+
 ## Development
 
 ```bash
@@ -228,9 +286,7 @@ make docker  # Build container
 Report security issues through [SECURITY.md](SECURITY.md), not a public issue.
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development and review requirements
 and [docs/operations.md](docs/operations.md) for health, backup, restoration,
-rotation, and incident-response procedures. The local hardening history and
-verification evidence are tracked in
-[PRODUCTION_HARDENING.md](PRODUCTION_HARDENING.md).
+rotation, and incident-response procedures.
 
 ## License
 
