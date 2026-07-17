@@ -222,6 +222,9 @@ func (s *Server) storeIdempotency(ctx context.Context, principalID, operation, k
 
 func (s *Server) handlePropose(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	start := time.Now()
+	if err := s.requireMutationsEnabled(); err != nil {
+		return nil, err
+	}
 	principal := authFromContext(ctx)
 	reqID := requestIDFromContext(ctx)
 
@@ -868,6 +871,15 @@ func (s *Server) recordLedger(reqID string, principal auth.Principal, operation 
 			"error", sanitizeError(err),
 		)
 	}
+}
+
+// requireMutationsEnabled rejects mutations in recovery read-only mode (after
+// a restore, until cross-database reconciliation succeeds).
+func (s *Server) requireMutationsEnabled() error {
+	if s.cfg.RecoveryReadOnly {
+		return fmt.Errorf("recovery read-only mode: mutations are disabled until reconciliation succeeds")
+	}
+	return nil
 }
 
 // beginAuditIntent persists a durable audit intent before any side effect of

@@ -33,7 +33,7 @@ var (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "Usage: charon <serve|version|obol|principal|proposal|ledger>")
+		fmt.Fprintln(os.Stderr, "Usage: charon <serve|version|obol|principal|proposal|ledger|backup|reconcile>")
 		os.Exit(1)
 	}
 
@@ -60,6 +60,14 @@ func main() {
 		}
 	case "ledger":
 		if err := runLedger(); err != nil {
+			log.Fatal(err)
+		}
+	case "backup":
+		if err := runBackup(); err != nil {
+			log.Fatal(err)
+		}
+	case "reconcile":
+		if err := runReconcile(); err != nil {
 			log.Fatal(err)
 		}
 	default:

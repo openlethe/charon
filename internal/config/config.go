@@ -115,6 +115,10 @@ type Config struct {
 	// socket, or a loopback endpoint. Always logged when set.
 	AllowInsecureUpstream bool `env:"CHARON_ALLOW_INSECURE_UPSTREAM" envDefault:"false"`
 
+	// RecoveryReadOnly disables every mutation after a restore until
+	// cross-database reconciliation succeeds (charon reconcile).
+	RecoveryReadOnly bool `env:"CHARON_RECOVERY_READONLY" envDefault:"false"`
+
 	// MaxResultBytes caps MCP tool response sizes.
 	MaxResultBytes int `env:"CHARON_MAX_RESULT_BYTES" envDefault:"1048576"`
 
@@ -221,6 +225,7 @@ func FromEnv() (*Config, error) {
 		LedgerKeyID:                os.Getenv("CHARON_LEDGER_KEY_ID"),
 		LedgerAnchorPath:           os.Getenv("CHARON_LEDGER_ANCHOR_PATH"),
 		AllowInsecureUpstream:      allowInsecureUpstream,
+		RecoveryReadOnly:           getEnvStringBool("CHARON_RECOVERY_READONLY"),
 		MaxResultBytes:             maxResultBytes,
 		MaxResultCount:             maxResultCount,
 		MaxRequestBytes:            int64(maxRequestBytes),
@@ -419,6 +424,14 @@ func (c *Config) MergeKey() string { return firstNonEmpty(c.MergeHMACKey, c.HMAC
 
 // LedgerKey returns the purpose-specific ledger key or the legacy fallback.
 func (c *Config) LedgerKey() string { return firstNonEmpty(c.LedgerHMACKey, c.HMACKey) }
+
+// getEnvStringBool reads a boolean env var, defaulting to false on absence or
+// unparseable values; used for operator kill-switches that must never block
+// startup on a typo.
+func getEnvStringBool(key string) bool {
+	v, _ := getEnvBool(key, false)
+	return v
+}
 
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {

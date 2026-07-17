@@ -119,6 +119,9 @@ func (s *Server) registerMemoryGitTools() {
 
 func (s *Server) handleMemoryRepoInit(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	start := time.Now()
+	if err := s.requireMutationsEnabled(); err != nil {
+		return nil, err
+	}
 	principal := authFromContext(ctx)
 	reqID := requestIDFromContext(ctx)
 	if err := policy.RequireScope(principal, "memory.commit"); err != nil {
@@ -234,6 +237,9 @@ func (s *Server) handleMemoryShow(ctx context.Context, request mcp.CallToolReque
 
 func (s *Server) handleMemoryBranchCreate(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	start := time.Now()
+	if err := s.requireMutationsEnabled(); err != nil {
+		return nil, err
+	}
 	principal := authFromContext(ctx)
 	reqID := requestIDFromContext(ctx)
 	if err := policy.RequireScope(principal, "memory.branch"); err != nil {
@@ -378,6 +384,9 @@ func (s *Server) handleMemoryContextAt(ctx context.Context, request mcp.CallTool
 
 func (s *Server) handleMemoryChangesetCreate(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	start := time.Now()
+	if err := s.requireMutationsEnabled(); err != nil {
+		return nil, err
+	}
 	principal := authFromContext(ctx)
 	reqID := requestIDFromContext(ctx)
 	if err := policy.RequireScope(principal, "memory.commit"); err != nil {
@@ -504,6 +513,9 @@ func (s *Server) changesetResultFromID(ctx context.Context, changesetID string) 
 
 func (s *Server) handleMemoryMergePropose(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	start := time.Now()
+	if err := s.requireMutationsEnabled(); err != nil {
+		return nil, err
+	}
 	principal := authFromContext(ctx)
 	reqID := requestIDFromContext(ctx)
 	if err := policy.RequireScope(principal, "memory.propose"); err != nil {
@@ -660,6 +672,9 @@ func (s *Server) handleMemoryMergePropose(ctx context.Context, request mcp.CallT
 
 func (s *Server) handleMemoryMergeReview(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	start := time.Now()
+	if err := s.requireMutationsEnabled(); err != nil {
+		return nil, err
+	}
 	principal := authFromContext(ctx)
 	reqID := requestIDFromContext(ctx)
 	if err := policy.RequireScope(principal, "memory.review"); err != nil {
@@ -721,6 +736,9 @@ func (s *Server) handleMemoryMergeReview(ctx context.Context, request mcp.CallTo
 
 func (s *Server) handleMemoryMerge(ctx context.Context, request mcp.CallToolRequest) (result *mcp.CallToolResult, mergeErr error) {
 	start := time.Now()
+	if err := s.requireMutationsEnabled(); err != nil {
+		return nil, err
+	}
 	principal := authFromContext(ctx)
 	reqID := requestIDFromContext(ctx)
 	if err := policy.RequireScope(principal, "memory.merge"); err != nil {
@@ -1028,6 +1046,9 @@ func approvalReviewer(p *proposal.Proposal, bindingMatch func(proposal.ReviewFin
 
 func (s *Server) handleMemoryMergeCancel(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	start := time.Now()
+	if err := s.requireMutationsEnabled(); err != nil {
+		return nil, err
+	}
 	principal := authFromContext(ctx)
 	reqID := requestIDFromContext(ctx)
 	if err := policy.RequireScope(principal, "memory.propose"); err != nil {
