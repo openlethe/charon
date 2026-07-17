@@ -536,3 +536,22 @@ was verified in code before fixing:
 Cross-service e2e (docker compose stack): full propose→review→merge flow
 with v2 envelopes passes, restart persistence verified, reviewed-merge op
 shape accepted by the real service.
+
+6. **Round 6** — recovery baseline capture on read paths; reject-retirement
+   convergence; context manifest recovery gate. Fixed.
+7. **Round 7** — approval TOCTOU in the merge path (now revalidated at the
+   last responsible moment before every protected advance); supersede
+   replacement identity fallbacks now collision-checked.
+8. **Round 8** — MAC-strip detection in ledger Verify; periodic audit
+   reconciliation with the ownership heartbeat; recovery suspends assembly
+   retention pruning. Fixed.
+9. **Round 9** — MACed rows fail closed without a configured key. **Lethe
+   clean: no accepted/actionable findings.**
+10. **Round 10–12** — ambiguous-vs-failed outcomes on landed mutations;
+    plaintext override defaults off (explicit opt-in for the Docker Desktop
+    gateway only); bind→named volume migration documented; backup runbook
+    stops both gateways.
+13. **Round 13 — Charon clean: no accepted/actionable findings.**
+
+Both branches exited the review loop with zero accepted/actionable findings
+(codex gpt-5.5, ~190k-char bundles per round).
