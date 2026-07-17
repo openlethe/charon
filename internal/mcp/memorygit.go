@@ -490,10 +490,12 @@ func (s *Server) handleMemoryChangesetCreate(ctx context.Context, request mcp.Ca
 		return nil, fmt.Errorf("changeset create failed: %w", err)
 	}
 
-	// Store idempotency; a concurrent same-key race returns the winner.
+	// Store idempotency; a concurrent same-key race returns the winner. The
+	// changeset already landed upstream, so a local bookkeeping failure is an
+	// ambiguous outcome — never a recorded failure of a landed mutation.
 	existingIdem, err := s.storeIdempotency(ctx, principal.ID, "memory_changeset_create", idempotencyKey, typed, "success", cs.ChangesetID)
 	if err != nil {
-		s.finishAudit(intent, err)
+		s.finishAuditAmbiguous(intent, err)
 		return nil, err
 	}
 	if existingIdem != nil {
