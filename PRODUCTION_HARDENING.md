@@ -510,3 +510,29 @@ race tests, gosec, govulncheck — 0 affecting vulnerabilities).
   supported production transports.
 - OAuth pairing/connector reauthorization and live tunnel verification remain
   operator tasks from earlier phases.
+
+### Structured autoreview cycles (codex, gpt-5.5, branch bundles)
+
+Five review rounds against the remediation branches. Every accepted finding
+was verified in code before fixing:
+
+1. **Round 1** — root-changeset validation panic (lethe); compose transport
+   default rejected (charon); direct-mode recovery-gate gap; audit
+   reconciliation racing the dual-gateway sibling. All fixed with regression
+   tests (instance-leased reconciliation added, migration v7).
+2. **Round 2** — audit outcomes could record landed merges as failed; open
+   intent left by parent validation; recovery read path implicitly created
+   the legacy root. Fixed; cross-service envelope conformance test added.
+3. **Round 3** — failed CAS rolled back nonce consumption (replay after ref
+   cycle-back); container startup contract unclear; reviewed-merge op
+   violated the new attestation contract; ledger CLI skipped MAC/anchor
+   checks. Fixed (two-phase nonce burn, entrypoint preflight, attestation
+   summary, CLI wiring).
+4. **Round 4** — direct-mode mutations bypassed the audit outbox; CI compose
+   env missing merge key; entrypoint ignored --api-key flag forms. Fixed.
+5. **Round 5** — recovery flag silently disabled on invalid values; reconcile
+   skipped keyed MAC verification. Fixed (strict parse; keyed VerifyLocal).
+
+Cross-service e2e (docker compose stack): full propose→review→merge flow
+with v2 envelopes passes, restart persistence verified, reviewed-merge op
+shape accepted by the real service.

@@ -365,6 +365,11 @@ func (s *Server) handleMemoryContextAt(ctx context.Context, request mcp.CallTool
 	canPinManifest := policy.RequireProject(principal, project) == nil &&
 		(policy.RequireScope(principal, "memory.commit") == nil ||
 			policy.RequireScope(principal, "memory.write") == nil)
+	if s.cfg.RecoveryReadOnly {
+		// Manifest pinning is an upstream write; recovery read-only serves
+		// the context projection without it.
+		canPinManifest = false
+	}
 	view, err := s.lethe.GetMemoryContext(ctx, project, lethe.MemoryContextRequest{
 		RefName:         refName,
 		HeadChangesetID: getString(args, "head_changeset_id"),
@@ -716,22 +721,38 @@ func (s *Server) handleMemoryMergeReview(ctx context.Context, request mcp.CallTo
 		Severity:              getString(args, "severity"),
 		TargetHeadChangesetID: target.HeadChangesetID,
 	})
-	if err != nil {
-		s.finishAudit(intent, err)
-		return nil, err
-	}
 	// A reject verdict is a terminal decision: the proposal closes and its
-	// conflicts retire so they cannot block or pollute future merges.
+	// conflicts retire so they cannot block or pollute future merges. Both
+	// steps are idempotent and converge on retry: if a previous attempt
+	// closed the proposal but failed to reach Lethe (or the finding could
+	// not be re-appended), the repeated review still retries retirement
+	// instead of stranding open conflicts.
 	if getString(args, "verdict") == string(proposal.ReviewVerdictReject) {
-		if p, err = s.proposalSvc.Reject(ctx, proposal.RejectRequest{ProposalID: proposalID, DecidedBy: principal.ID}); err != nil {
-			s.finishAudit(intent, err)
-			return nil, fmt.Errorf("close rejected proposal: %w", err)
+		if err != nil {
+			// The finding may already be attached from a previous attempt;
+			// converge when the proposal is already rejected.
+			existing, getErr := s.proposalSvc.Get(ctx, proposalID)
+			if getErr != nil || existing.Status != proposal.StatusRejected {
+				s.finishAudit(intent, err)
+				return nil, err
+			}
+			p = existing
+		} else if p, err = s.proposalSvc.Reject(ctx, proposal.RejectRequest{ProposalID: proposalID, DecidedBy: principal.ID}); err != nil {
+			existing, getErr := s.proposalSvc.Get(ctx, proposalID)
+			if getErr != nil || existing.Status != proposal.StatusRejected {
+				s.finishAudit(intent, err)
+				return nil, fmt.Errorf("close rejected proposal: %w", err)
+			}
+			p = existing
 		}
 		if err := s.lethe.RetireConflicts(ctx, p.ProjectID, p.ID, "rejected"); err != nil {
-			s.finishAudit(intent, err)
+			s.finishAuditAmbiguous(intent, err)
 			s.recordLedger(reqID, principal, "memory_merge_review", []string{p.ProjectID}, "error: conflict retirement failed: "+sanitizeError(err), time.Since(start))
-			return nil, fmt.Errorf("proposal rejected but conflict retirement failed: %w", err)
+			return nil, fmt.Errorf("proposal rejected but conflict retirement failed (retry review to converge): %w", err)
 		}
+	} else if err != nil {
+		s.finishAudit(intent, err)
+		return nil, err
 	}
 	s.finishAudit(intent, nil)
 	data, _ := json.MarshalIndent(p, "", "  ")
