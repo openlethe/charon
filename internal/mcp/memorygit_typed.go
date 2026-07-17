@@ -1,8 +1,10 @@
 package mcp
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
+	"strings"
 
 	"github.com/openlethe/charon/internal/upstream/lethe"
 )
@@ -37,6 +39,94 @@ type typedSemanticOp struct {
 	TargetEventID    string
 	ResultingEventID string
 	Payload          map[string]any
+}
+
+// Payload size caps, mirroring lethe/internal/db/memory_git_validation.go.
+// Charon fails before any upstream side effect; Lethe remains the
+// authoritative enforcer with identical bounds. Keep in sync.
+const (
+	// maxOpPayloadBytes bounds the canonical JSON encoding of one op's
+	// payload (Go marshals map keys in sorted order, so this is exact).
+	maxOpPayloadBytes = 64 << 10
+	// maxContentBytes bounds free-text memory content.
+	maxContentBytes = 16 << 10
+	// maxSummaryBytes bounds human-readable summaries, reasons, and notes.
+	maxSummaryBytes = 4 << 10
+	// maxFieldBytes bounds every other payload string and the op-level ID
+	// channels (identifiers, kinds, provenance references).
+	maxFieldBytes = 1024
+	// maxTagBytes bounds a single tag entry.
+	maxTagBytes = 128
+	// maxTags bounds the tags array of one op.
+	maxTags = 64
+)
+
+// attestationProvenanceKeys are the merge/review provenance markers. They are
+// legitimate on every op because cherry-pick construction annotates copied ops
+// (e.g. a cherry-picked add_memory records cherrypicked_from).
+var attestationProvenanceKeys = []string{
+	"reviewer", "proposal_id", "source_changeset_id",
+	"rejected_from", "cherrypicked_from", "left_branch", "right_branch",
+}
+
+// commonPayloadKeys have defined semantics for every op type: diff summaries,
+// boundary and scope-flow metadata, and merge provenance.
+var commonPayloadKeys = append([]string{
+	"summary", "project_id", "topic_id", "actor_id", "from_visibility", "to_visibility",
+}, attestationProvenanceKeys...)
+
+// memoryContentKeys are the projector overlay fields plus the fact/decision
+// metadata the conflict detector compares.
+var memoryContentKeys = []string{
+	"content", "kind", "event_type", "scope", "visibility", "tags", "confidence",
+	"fact_key", "subject", "valid_from", "valid_to", "protected", "approval",
+}
+
+// attestationPayloadKeys are the evidence-record fields an attach op may
+// carry in addition to the provenance markers.
+var attestationPayloadKeys = []string{"kind", "source", "note", "status"}
+
+// allowedPayloadKeys mirrors Lethe's closed payload key contract per op type.
+// Unknown keys are rejected by name before any upstream call.
+var allowedPayloadKeys = map[string]map[string]bool{
+	"add_memory":     keySet(commonPayloadKeys, memoryContentKeys, []string{"memory_id", "event_id"}),
+	"correct_memory": keySet(commonPayloadKeys, memoryContentKeys, []string{"target_trust", "source_trust"}),
+	"supersede_memory": keySet(commonPayloadKeys, memoryContentKeys,
+		[]string{"target_trust", "source_trust", "memory_id", "event_id"}),
+	"mark_duplicate":      keySet(commonPayloadKeys, []string{"duplicate_id", "duplicate_of"}),
+	"add_relationship":    keySet(commonPayloadKeys, []string{"kind", "from_memory_id", "to_memory_id"}),
+	"propose_deprecation": keySet(commonPayloadKeys, []string{"reason"}),
+	"attach_evidence":     keySet(commonPayloadKeys, attestationPayloadKeys),
+	"attach_verification": keySet(commonPayloadKeys, attestationPayloadKeys),
+}
+
+func keySet(groups ...[]string) map[string]bool {
+	set := map[string]bool{}
+	for _, group := range groups {
+		for _, key := range group {
+			set[key] = true
+		}
+	}
+	return set
+}
+
+// payloadStringLimit returns the size cap for a free-text payload field.
+func payloadStringLimit(key string) int {
+	switch key {
+	case "content":
+		return maxContentBytes
+	case "summary", "reason", "note":
+		return maxSummaryBytes
+	default:
+		return maxFieldBytes
+	}
+}
+
+// idsDisagree reports whether two identifier channels for the same role are
+// both set but name different identities. Equal values via two channels are
+// fine: the projector's fallback order simply normalizes them.
+func idsDisagree(a, b string) bool {
+	return a != "" && b != "" && a != b
 }
 
 // typedChangesetCreate is the canonical memory_changeset_create request.
@@ -183,19 +273,65 @@ func parseSemanticOps(raw any) ([]typedSemanticOp, error) {
 // validateOpStructure enforces the operation-specific invariants Charon can
 // prove without memory state. Lethe re-validates everything against the
 // parent state; these checks stop malformed requests before any upstream side
-// effect and never silently drop caller input.
+// effect and never silently drop caller input. Size caps, the closed payload
+// key sets, and the ambiguous-identifier rules mirror Lethe's stateless
+// validation exactly.
 func validateOpStructure(index int, op typedSemanticOp) error {
+	fail := func(format string, args ...any) error {
+		return fmt.Errorf("ops[%d] (%s): %s", index, op.OpType, fmt.Sprintf(format, args...))
+	}
+	encoded, err := json.Marshal(op.Payload)
+	if err != nil {
+		return fail("payload is not JSON-encodable: %v", err)
+	}
+	if len(encoded) > maxOpPayloadBytes {
+		return fail("payload is %d bytes, exceeding the %d-byte per-op cap", len(encoded), maxOpPayloadBytes)
+	}
+	if len(op.TargetEventID) > maxFieldBytes {
+		return fail("target_event_id exceeds the %d-byte identifier cap", maxFieldBytes)
+	}
+	if len(op.ResultingEventID) > maxFieldBytes {
+		return fail("resulting_event_id exceeds the %d-byte identifier cap", maxFieldBytes)
+	}
+	if allowed, ok := allowedPayloadKeys[op.OpType]; ok {
+		for key, value := range op.Payload {
+			if !allowed[key] {
+				return fail("payload field %q is not supported for %s", key, op.OpType)
+			}
+			if text, isString := value.(string); isString {
+				if limit := payloadStringLimit(key); len(text) > limit {
+					return fail("payload.%s exceeds the %d-byte cap", key, limit)
+				}
+			}
+		}
+		if tags, present := op.Payload["tags"]; present {
+			if list, isList := tags.([]any); isList {
+				if len(list) > maxTags {
+					return fail("payload.tags has %d entries, exceeding the %d-entry cap", len(list), maxTags)
+				}
+				for _, tag := range list {
+					if text, isString := tag.(string); isString && len(text) > maxTagBytes {
+						return fail("payload.tags entry exceeds the %d-byte cap", maxTagBytes)
+					}
+				}
+			}
+		}
+	}
 	payloadString := func(key string) string {
 		text, _ := op.Payload[key].(string)
 		return text
-	}
-	fail := func(format string, args ...any) error {
-		return fmt.Errorf("ops[%d] (%s): %s", index, op.OpType, fmt.Sprintf(format, args...))
 	}
 	switch op.OpType {
 	case "add_memory":
 		if payloadString("content") == "" {
 			return fail("payload.content is required and must be a non-empty string")
+		}
+		// The resulting identity may arrive over three channels; they must
+		// never disagree about which memory this op creates.
+		if idsDisagree(op.ResultingEventID, payloadString("memory_id")) ||
+			idsDisagree(op.ResultingEventID, payloadString("event_id")) ||
+			idsDisagree(payloadString("memory_id"), payloadString("event_id")) {
+			return fail("ambiguous resulting identity: resulting_event_id, payload.memory_id, and payload.event_id must agree when more than one is set")
 		}
 	case "correct_memory":
 		if op.TargetEventID == "" {
@@ -211,7 +347,22 @@ func validateOpStructure(index int, op typedSemanticOp) error {
 		if op.ResultingEventID != "" && op.ResultingEventID == op.TargetEventID {
 			return fail("resulting_event_id must differ from target_event_id (no self-supersede)")
 		}
+		// The replacement identity may arrive over three channels; they must
+		// never disagree about which memory replaces the target.
+		if idsDisagree(op.ResultingEventID, payloadString("memory_id")) ||
+			idsDisagree(op.ResultingEventID, payloadString("event_id")) ||
+			idsDisagree(payloadString("memory_id"), payloadString("event_id")) {
+			return fail("ambiguous replacement identity: resulting_event_id, payload.memory_id, and payload.event_id must agree when more than one is set")
+		}
 	case "mark_duplicate":
+		// The duplicate and canonical identities each have two channels; a
+		// disagreement would make the recorded lineage ambiguous.
+		if idsDisagree(op.TargetEventID, payloadString("duplicate_id")) {
+			return fail("ambiguous duplicate identity: target_event_id and payload.duplicate_id must agree when both are set")
+		}
+		if idsDisagree(op.ResultingEventID, payloadString("duplicate_of")) {
+			return fail("ambiguous canonical identity: resulting_event_id and payload.duplicate_of must agree when both are set")
+		}
 		duplicate := op.TargetEventID
 		if duplicate == "" {
 			duplicate = payloadString("duplicate_id")
@@ -227,6 +378,12 @@ func validateOpStructure(index int, op typedSemanticOp) error {
 			return fail("duplicate and canonical targets must be distinct")
 		}
 	case "add_relationship":
+		if idsDisagree(op.TargetEventID, payloadString("from_memory_id")) {
+			return fail("ambiguous from identity: target_event_id and payload.from_memory_id must agree when both are set")
+		}
+		if idsDisagree(op.ResultingEventID, payloadString("to_memory_id")) {
+			return fail("ambiguous to identity: resulting_event_id and payload.to_memory_id must agree when both are set")
+		}
 		from := op.TargetEventID
 		if from == "" {
 			from = payloadString("from_memory_id")
@@ -252,11 +409,26 @@ func validateOpStructure(index int, op typedSemanticOp) error {
 			return fail("payload.reason is required and must be a non-empty string")
 		}
 	case "attach_evidence", "attach_verification":
-		if op.TargetEventID == "" {
-			return fail("target_event_id is required")
-		}
 		if len(op.Payload) == 0 {
 			return fail("payload must be a non-empty object")
+		}
+		if op.TargetEventID == "" {
+			// Target-less form is a merge/review attestation marker, matching
+			// Lethe: it needs a human-readable summary and at least one
+			// provenance field.
+			if payloadString("summary") == "" {
+				return fail("target-less attestation requires payload.summary")
+			}
+			provenance := false
+			for _, key := range attestationProvenanceKeys {
+				if payloadString(key) != "" {
+					provenance = true
+					break
+				}
+			}
+			if !provenance {
+				return fail("target-less attestation requires a provenance field (one of: %s)", strings.Join(attestationProvenanceKeys, ", "))
+			}
 		}
 	}
 	return nil

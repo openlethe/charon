@@ -209,3 +209,90 @@ func hashForTest(t *testing.T, v any) string {
 	}
 	return strings.TrimSpace(string(data))
 }
+
+// The mirrored Lethe contract: size caps, closed payload key sets, and
+// ambiguous-identifier rules reject before any upstream side effect.
+func TestValidateOpStructureMirroredContractRules(t *testing.T) {
+	reject := map[string]typedSemanticOp{
+		"payload over 64 KiB cap": {
+			OpType: "supersede_memory", TargetEventID: "m1",
+			Payload: map[string]any{"approval": map[string]any{"blob": strings.Repeat("x", 70<<10)}},
+		},
+		"content over 16 KiB cap": {
+			OpType:  "add_memory",
+			Payload: map[string]any{"content": strings.Repeat("x", 17<<10)},
+		},
+		"string field over 1 KiB cap": {
+			OpType:  "add_memory",
+			Payload: map[string]any{"content": "ok", "scope": strings.Repeat("s", 2048)},
+		},
+		"too many tags": {
+			OpType:  "add_memory",
+			Payload: map[string]any{"content": "ok", "tags": make([]any, 65)},
+		},
+		"tag over 128-byte cap": {
+			OpType:  "add_memory",
+			Payload: map[string]any{"content": "ok", "tags": []any{strings.Repeat("t", 200)}},
+		},
+		"unknown payload key": {
+			OpType:  "add_memory",
+			Payload: map[string]any{"content": "ok", "bogus": 1},
+		},
+		"ambiguous resulting identity": {
+			OpType:           "add_memory",
+			ResultingEventID: "r1",
+			Payload:          map[string]any{"content": "ok", "memory_id": "r2"},
+		},
+		"ambiguous replacement identity": {
+			OpType:           "supersede_memory",
+			TargetEventID:    "m1",
+			ResultingEventID: "r1",
+			Payload:          map[string]any{"memory_id": "r2"},
+		},
+		"ambiguous duplicate identity": {
+			OpType:        "mark_duplicate",
+			TargetEventID: "d1",
+			Payload:       map[string]any{"duplicate_id": "d2", "duplicate_of": "c1"},
+		},
+		"ambiguous relationship endpoint": {
+			OpType:        "add_relationship",
+			TargetEventID: "f1",
+			Payload:       map[string]any{"from_memory_id": "f2", "to_memory_id": "t1", "kind": "supports"},
+		},
+		"target-less attestation without summary": {
+			OpType:  "attach_evidence",
+			Payload: map[string]any{"proposal_id": "p1"},
+		},
+		"target-less attestation without provenance": {
+			OpType:  "attach_verification",
+			Payload: map[string]any{"summary": "reviewed merge"},
+		},
+	}
+	for name, op := range reject {
+		if err := validateOpStructure(0, op); err == nil {
+			t.Fatalf("%s: expected rejection", name)
+		}
+	}
+
+	accept := map[string]typedSemanticOp{
+		"target-less attestation with summary and provenance": {
+			OpType:  "attach_verification",
+			Payload: map[string]any{"summary": "reviewed merge proposal p1", "proposal_id": "p1", "kind": "reviewed_merge"},
+		},
+		"identity repeated on two channels agrees": {
+			OpType:           "add_memory",
+			ResultingEventID: "r1",
+			Payload:          map[string]any{"content": "ok", "memory_id": "r1"},
+		},
+		"targeted attachment": {
+			OpType:        "attach_evidence",
+			TargetEventID: "m1",
+			Payload:       map[string]any{"note": "ci run green"},
+		},
+	}
+	for name, op := range accept {
+		if err := validateOpStructure(0, op); err != nil {
+			t.Fatalf("%s: expected acceptance, got %v", name, err)
+		}
+	}
+}
