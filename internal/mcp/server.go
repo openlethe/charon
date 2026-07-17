@@ -15,6 +15,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 	"github.com/openlethe/charon/internal/audit"
 	"github.com/openlethe/charon/internal/auth"
+	"github.com/openlethe/charon/internal/canonical"
 	"github.com/openlethe/charon/internal/config"
 	"github.com/openlethe/charon/internal/idempotency"
 	"github.com/openlethe/charon/internal/ledger"
@@ -299,8 +300,15 @@ func (s *Server) handlePropose(ctx context.Context, request mcp.CallToolRequest)
 		RequestID:      reqID,
 	}
 
+	intent, err := s.beginAuditIntent(ctx, principal, "memory_propose", project,
+		canonical.MustDigest("charon/audit-request/v1", args),
+		project, "create memory proposal")
+	if err != nil {
+		return nil, err
+	}
 	p, err := s.proposalSvc.Create(ctx, createReq)
 	if err != nil {
+		s.finishAudit(intent, err)
 		s.recordLedger(reqID, principal, "memory_propose", []string{project}, "error: "+sanitizeError(err), time.Since(start))
 		return nil, fmt.Errorf("create proposal failed: %w", err)
 	}
@@ -308,13 +316,16 @@ func (s *Server) handlePropose(ctx context.Context, request mcp.CallToolRequest)
 	// Store idempotency record
 	existingIdem, err := s.storeIdempotency(ctx, principal.ID, "memory_propose", idempotencyKey, args, "pending", p.ID)
 	if err != nil {
+		s.finishAuditAmbiguous(intent, err)
 		return nil, err
 	}
 	if existingIdem != nil {
 		// Lost the race - return the winner's result
+		s.finishAudit(intent, nil)
 		data, _ := json.MarshalIndent(map[string]interface{}{"proposal_id": existingIdem.ResultingResourceID, "status": "pending", "existing": true}, "", "  ")
 		return mcp.NewToolResultText(string(data)), nil
 	}
+	s.finishAudit(intent, nil)
 
 	data, _ := json.MarshalIndent(map[string]interface{}{"proposal_id": p.ID, "status": p.Status}, "", "  ")
 	s.recordLedger(reqID, principal, "memory_propose", []string{project}, "success", time.Since(start))
@@ -390,8 +401,15 @@ func (s *Server) handleCheckpoint(ctx context.Context, request mcp.CallToolReque
 		RequestID:      reqID,
 	}
 
+	intent, err := s.beginAuditIntent(ctx, principal, "memory_checkpoint", project,
+		canonical.MustDigest("charon/audit-request/v1", args),
+		project, "create checkpoint proposal")
+	if err != nil {
+		return nil, err
+	}
 	p, err := s.proposalSvc.Create(ctx, createReq)
 	if err != nil {
+		s.finishAudit(intent, err)
 		s.recordLedger(reqID, principal, "memory_checkpoint", []string{project}, "error: "+sanitizeError(err), time.Since(start))
 		return nil, fmt.Errorf("create checkpoint failed: %w", err)
 	}
@@ -399,13 +417,16 @@ func (s *Server) handleCheckpoint(ctx context.Context, request mcp.CallToolReque
 	// Store idempotency record
 	existingIdem, err := s.storeIdempotency(ctx, principal.ID, "memory_checkpoint", idempotencyKey, args, "pending", p.ID)
 	if err != nil {
+		s.finishAuditAmbiguous(intent, err)
 		return nil, err
 	}
 	if existingIdem != nil {
 		// Lost the race - return the winner's result
+		s.finishAudit(intent, nil)
 		data, _ := json.MarshalIndent(map[string]interface{}{"proposal_id": existingIdem.ResultingResourceID, "status": "pending", "existing": true}, "", "  ")
 		return mcp.NewToolResultText(string(data)), nil
 	}
+	s.finishAudit(intent, nil)
 
 	data, _ := json.MarshalIndent(map[string]interface{}{"proposal_id": p.ID, "status": p.Status}, "", "  ")
 	s.recordLedger(reqID, principal, "memory_checkpoint", []string{project}, "success", time.Since(start))
@@ -516,9 +537,19 @@ func (s *Server) handleWrite(ctx context.Context, request mcp.CallToolRequest) (
 		return nil, fmt.Errorf("content exceeds maximum size of %d bytes", s.cfg.MaxResultBytes)
 	}
 
+	// Direct-mode mutations use the same mandatory audit outbox as every
+	// Memory Git mutation: durable intent before the upstream side effect.
+	intent, err := s.beginAuditIntent(ctx, principal, "memory_write", project,
+		canonical.MustDigest("charon/audit-request/v1", args),
+		project, "create event")
+	if err != nil {
+		return nil, err
+	}
+
 	// Write to Lethe
 	event, err := s.lethe.CreateEvent(ctx, letheReq)
 	if err != nil {
+		s.finishAudit(intent, err)
 		s.recordLedger(reqID, principal, "memory_write", []string{project}, "error: "+sanitizeError(err), time.Since(start))
 		return nil, fmt.Errorf("write failed: %w", err)
 	}
@@ -526,10 +557,12 @@ func (s *Server) handleWrite(ctx context.Context, request mcp.CallToolRequest) (
 	// Store idempotency record
 	existingIdem, err := s.storeIdempotency(ctx, principal.ID, "memory_write", idempotencyKey, args, "success", event.ID)
 	if err != nil {
+		s.finishAuditAmbiguous(intent, err)
 		return nil, err
 	}
 	if existingIdem != nil {
 		// Lost the race - return the winner's result
+		s.finishAudit(intent, nil)
 		data, _ := json.MarshalIndent(map[string]interface{}{
 			"event_id": existingIdem.ResultingResourceID,
 			"project":  event.Project,
@@ -540,6 +573,7 @@ func (s *Server) handleWrite(ctx context.Context, request mcp.CallToolRequest) (
 		return mcp.NewToolResultText(string(data)), nil
 	}
 
+	s.finishAudit(intent, nil)
 	data, _ := json.MarshalIndent(map[string]interface{}{
 		"event_id": event.ID,
 		"project":  event.Project,
