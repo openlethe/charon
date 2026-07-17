@@ -3,9 +3,9 @@
 # lines shifts or a new secret appears in the same file, the scan flags it
 # again and forces explicit review. Do not add path- or rule-wide exemptions.
 #
-# internal/config/upstream_test.go — HMAC-key test constants (commit ddcb85a)
-ddcb85a1291b0a90b98194967d92fc0014061046:internal/config/upstream_test.go:generic-api-key:37
-ddcb85a1291b0a90b98194967d92fc0014061046:internal/config/upstream_test.go:generic-api-key:39
-ddcb85a1291b0a90b98194967d92fc0014061046:internal/config/upstream_test.go:generic-api-key:40
-# internal/upstream/lethe/mergeauth_conformance_test.go — merge-auth conformance fixture key (commit 758fb40)
-758fb400399463f4d285e340d93755d120921c0a:internal/upstream/lethe/mergeauth_conformance_test.go:generic-api-key:98
+# internal/config/upstream_test.go — HMAC-key test constants (commit b08990c)
+b08990c4da7b9c366275f2f06ec8226162cd6eb7:internal/config/upstream_test.go:generic-api-key:37
+b08990c4da7b9c366275f2f06ec8226162cd6eb7:internal/config/upstream_test.go:generic-api-key:39
+b08990c4da7b9c366275f2f06ec8226162cd6eb7:internal/config/upstream_test.go:generic-api-key:40
+# internal/upstream/lethe/mergeauth_conformance_test.go — merge-auth conformance fixture key (commit 69afee4)
+69afee4044017ea64ea4257a59ebcb01a7e811ec:internal/upstream/lethe/mergeauth_conformance_test.go:generic-api-key:98
