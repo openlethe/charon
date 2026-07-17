@@ -243,6 +243,7 @@ func (s *Service) Verify(ctx context.Context) (int64, error) {
 
 	var count int64
 	var previous []byte
+	var seenMAC bool
 	for rows.Next() {
 		var entry Entry
 		var createdAt string
@@ -269,8 +270,12 @@ func (s *Service) Verify(ctx context.Context) (int64, error) {
 			return count, fmt.Errorf("ledger sequence %d has an invalid entry hash", entry.Sequence)
 		}
 		// Keyed MAC verification: rows written after v6 carry one and it must
-		// verify under the key its key ID names. Legacy unkeyed rows verify
-		// by hash only.
+		// verify under the key its key ID names. Rows before MAC support verify
+		// by hash only — but once any MACed row exists, a later row missing MAC
+		// material was stripped or forged, and fails closed.
+		if len(entry.EntryMAC) == 0 && seenMAC {
+			return count, fmt.Errorf("ledger sequence %d is missing MAC material after MACed entries exist (stripped or forged)", entry.Sequence)
+		}
 		if len(entry.EntryMAC) > 0 && len(s.keys) > 0 {
 			key, ok := s.keys[entry.KeyID]
 			if !ok {
@@ -281,6 +286,7 @@ func (s *Service) Verify(ctx context.Context) (int64, error) {
 			if !hmac.Equal(entry.EntryMAC, mac.Sum(nil)) {
 				return count, fmt.Errorf("ledger sequence %d has an invalid entry MAC", entry.Sequence)
 			}
+			seenMAC = true
 		}
 		previous = append([]byte(nil), entry.EntryHash...)
 		count++

@@ -195,3 +195,48 @@ func TestAnchorFileIsAppendOnly(t *testing.T) {
 		t.Fatalf("anchor lines = %d, want 2", len(lines))
 	}
 }
+
+// An attacker who strips MAC fields after tampering cannot hide behind the
+// legacy hash-only path: once any MACed entry exists, a later unMACed entry
+// fails closed.
+func TestStrippedMACDetected(t *testing.T) {
+	svc, db := openKeyedLedger(t, "")
+	record(t, svc, "op-a")
+	record(t, svc, "op-b")
+	record(t, svc, "op-c")
+
+	// Strip MAC material from the middle entry: the unkeyed hashes still
+	// chain, but the MAC gap after MACed entries is now detectable.
+	if _, err := db.Exec(`UPDATE ledger_entries SET entry_mac = NULL, key_id = NULL WHERE sequence = 2`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Verify(context.Background()); err == nil || !strings.Contains(err.Error(), "missing MAC material") {
+		t.Fatalf("stripped MAC not detected: %v", err)
+	}
+}
+
+// A legacy (pre-MAC) prefix followed by MACed entries verifies cleanly.
+func TestLegacyPrefixThenMACedEntriesVerify(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	// Two unkeyed (legacy) entries first.
+	unkeyed := NewService(db)
+	if err := unkeyed.Record(context.Background(), Entry{RequestID: "l1", Operation: "op", Result: "ok"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := unkeyed.Record(context.Background(), Entry{RequestID: "l2", Operation: "op", Result: "ok"}); err != nil {
+		t.Fatal(err)
+	}
+	// Then keyed entries.
+	keyed := NewService(db)
+	keyed.SetIntegrityKey([]byte(testLedgerKey), "kid-1")
+	if err := keyed.Record(context.Background(), Entry{RequestID: "k1", Operation: "op", Result: "ok"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := keyed.Verify(context.Background()); err != nil {
+		t.Fatalf("legacy prefix + MACed suffix must verify: %v", err)
+	}
+}

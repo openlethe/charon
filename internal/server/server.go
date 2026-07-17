@@ -200,10 +200,18 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	// Keep this instance's audit ownership alive so sibling reconciliation
-	// never retires our in-flight intents.
+	// never retires our in-flight intents. Periodic reconciliation runs with
+	// it: a process that crashed between intent and outcome and restarted
+	// before its heartbeat went stale still gets its stranded intents marked
+	// ambiguous once the dead owner's lease expires.
 	go func() {
 		ticker := time.NewTicker(audit.HeartbeatInterval)
 		defer ticker.Stop()
+		reconcileEvery := int(audit.IntentStaleAfter / audit.HeartbeatInterval)
+		if reconcileEvery < 1 {
+			reconcileEvery = 1
+		}
+		ticks := 0
 		for {
 			select {
 			case <-ticker.C:
@@ -212,6 +220,17 @@ func (s *Server) Start(ctx context.Context) error {
 					s.logger.Warn("audit ownership heartbeat failed", "error", sanitizeHealthError(err))
 				}
 				cancel()
+				ticks++
+				if ticks%reconcileEvery == 0 {
+					rcCtx, rcCancel := context.WithTimeout(context.Background(), 10*time.Second)
+					if reconciled, err := s.auditSvc.ReconcileAfterRestart(rcCtx, audit.IntentStaleAfter); err != nil {
+						s.logger.Warn("periodic audit reconciliation failed", "error", sanitizeHealthError(err))
+					} else if reconciled > 0 {
+						s.logger.Warn("periodic reconciliation marked dead-owner audit intents ambiguous",
+							"reconciled", reconciled)
+					}
+					rcCancel()
+				}
 			case <-ctx.Done():
 				return
 			}
