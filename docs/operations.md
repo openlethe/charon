@@ -48,13 +48,34 @@ upgrade that changes the MCP schema:
 Do not make `verdict` optional merely to preserve a stale connector schema; the
 explicit decision is part of the protected-ref authorization boundary.
 
+## Upgrading from the pre-named-volume Compose
+
+Earlier Compose revisions bind-mounted `./charon-data` at `/data`. Current
+revisions use the named volume `charon-data` (shared by both gateways). If
+you are upgrading from a bind-mounted deployment, migrate once before first
+start so the existing database is preserved:
+
+```bash
+docker compose stop charon charon-reviewer
+docker run --rm \
+  -v "$PWD/charon-data:/from:ro" \
+  -v charon_charon-data:/to \
+  alpine:3.23 \
+  sh -c 'cp -a /from/. /to/ && chown -R 10001:10001 /to'
+```
+
+Resolve the exact volume name with `docker compose config --volumes` if your
+project name differs. Do not start the new Compose before the copy finishes;
+starting first initializes an empty database and bootstrap treats it as a
+fresh install.
+
 ## Backup
 
 Charon's database contains principal grants, credential digests, proposals, idempotency records, and audit metadata. Treat backups as sensitive.
 
 Use a consistent offline snapshot:
 
-1. Stop Charon cleanly with `docker compose stop charon`.
+1. Stop every gateway that mounts the shared volume — at least `charon` and `charon-reviewer` — with `docker compose stop charon charon-reviewer`. (A sibling gateway left running can still write to `charon.db` and its WAL during the archive.)
 2. Identify the named volume with `docker compose config --volumes` and `docker volume ls`.
 3. Archive the volume using a temporary container and a protected destination. Replace `<volume>` with the resolved volume name:
 
@@ -68,7 +89,7 @@ Use a consistent offline snapshot:
      sh -c 'umask 077; tar -C /data -czf /backup/charon-data.tgz .'
    ```
 
-4. Restart with `docker compose start charon` and verify `/readyz`.
+4. Restart with `docker compose start charon charon-reviewer` and verify `/readyz` on both gateways.
 
 Encrypt backups at rest and test restoration periodically. Do not copy only `charon.db` from a live service; SQLite WAL state may be omitted.
 

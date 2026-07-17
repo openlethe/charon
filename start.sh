@@ -73,6 +73,14 @@ if ! check_http_200 --header "@${lethe_header_file}" "$lethe_health"; then
     exit 1
 fi
 
+# The Docker Desktop same-host gateway is the only upstream allowed to use
+# the plaintext override; every other upstream stays fail-closed.
+insecure_upstream=0
+if [[ "$upstream" == "http://host.docker.internal:18485" ]]; then
+    insecure_upstream=1
+fi
+export CHARON_ALLOW_INSECURE_UPSTREAM=${CHARON_ALLOW_INSECURE_UPSTREAM:-${insecure_upstream}}
+
 cd "$repo_root"
 docker compose up -d --build
 

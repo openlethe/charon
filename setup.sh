@@ -40,9 +40,18 @@ if [[ ! -f "$env_file" ]]; then
         exit 1
     fi
 
+    # The local Docker Desktop same-host gateway is the only upstream that
+    # gets the plaintext override, and only because this script is the
+    # documented local development path. Anything else stays fail-closed.
+    insecure_upstream=0
+    if [[ "$upstream" == "http://host.docker.internal:18485" ]]; then
+        insecure_upstream=1
+    fi
+
     cat > "$env_file" <<EOF
 LETHE_API_KEY=${LETHE_API_KEY}
 CHARON_UPSTREAM=${upstream}
+CHARON_ALLOW_INSECURE_UPSTREAM=${CHARON_ALLOW_INSECURE_UPSTREAM:-${insecure_upstream}}
 CHARON_MODE=memory-git
 CHARON_PUBLIC_URL=${public_url}
 CHARON_AUTH_MODE=${auth_mode}
