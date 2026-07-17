@@ -824,13 +824,13 @@ func (s *Server) handleMemoryMerge(ctx context.Context, request mcp.CallToolRequ
 	if err != nil || target == nil || !target.Protected {
 		return nil, fmt.Errorf("protected target ref is unavailable")
 	}
-	reviewer, approved := independentApprovalReviewer(p, target.HeadChangesetID)
+	_, approved := independentApprovalReviewer(p, target.HeadChangesetID)
 	if !approved && p.ChangesetID != "" && target.HeadChangesetID == p.ChangesetID {
 		// Crash recovery: the protected ref already advanced to the persisted
 		// merge result. Reaching that state required a signed merge advance
 		// derived from a bound approval, so accept the recorded independent
 		// approval instead of revalidating it against the post-merge head.
-		reviewer, approved = latestIndependentApprovalReviewer(p)
+		_, approved = latestIndependentApprovalReviewer(p)
 	}
 	if !approved {
 		return nil, fmt.Errorf("merge proposal has no current independent approval for the target head")
@@ -879,7 +879,14 @@ func (s *Server) handleMemoryMerge(ctx context.Context, request mcp.CallToolRequ
 			} else if len(result.ParentIDs) == 2 {
 				strategy = lethe.StrategyMergeCommit
 			}
-			if err := s.advanceProtectedMerge(ctx, p, target.HeadChangesetID, resultID, reviewer, principal.ID, strategy); err != nil {
+			// Re-validate approval against the freshest proposal state
+			// immediately before moving the protected ref.
+			fresh, freshReviewer, err := s.requireCurrentApproval(ctx, p.ID, target.HeadChangesetID)
+			if err != nil {
+				return nil, err
+			}
+			p = fresh
+			if err := s.advanceProtectedMerge(ctx, p, target.HeadChangesetID, resultID, freshReviewer, principal.ID, strategy); err != nil {
 				return nil, fmt.Errorf("recover protected merge: %w", err)
 			}
 			landed = true
@@ -917,7 +924,12 @@ func (s *Server) handleMemoryMerge(ctx context.Context, request mcp.CallToolRequ
 		if err != nil {
 			return nil, err
 		}
-		if err := s.advanceProtectedMerge(ctx, p, target.HeadChangesetID, resultID, reviewer, principal.ID, lethe.StrategyCherryPick); err != nil {
+		fresh, freshReviewer, err := s.requireCurrentApproval(ctx, p.ID, target.HeadChangesetID)
+		if err != nil {
+			return nil, err
+		}
+		p = fresh
+		if err := s.advanceProtectedMerge(ctx, p, target.HeadChangesetID, resultID, freshReviewer, principal.ID, lethe.StrategyCherryPick); err != nil {
 			return nil, fmt.Errorf("cherry-pick merge failed: %w", err)
 		}
 		landed = true
@@ -935,7 +947,12 @@ func (s *Server) handleMemoryMerge(ctx context.Context, request mcp.CallToolRequ
 			if err != nil {
 				return nil, err
 			}
-			if err := s.advanceProtectedMerge(ctx, p, target.HeadChangesetID, p.HeadChangesetID, reviewer, principal.ID, lethe.StrategyFastForward); err != nil {
+			fresh, freshReviewer, err := s.requireCurrentApproval(ctx, p.ID, target.HeadChangesetID)
+			if err != nil {
+				return nil, err
+			}
+			p = fresh
+			if err := s.advanceProtectedMerge(ctx, p, target.HeadChangesetID, p.HeadChangesetID, freshReviewer, principal.ID, lethe.StrategyFastForward); err != nil {
 				return nil, fmt.Errorf("fast-forward merge failed: %w", err)
 			}
 			landed = true
@@ -994,7 +1011,12 @@ func (s *Server) handleMemoryMerge(ctx context.Context, request mcp.CallToolRequ
 			if err != nil {
 				return nil, err
 			}
-			if err := s.advanceProtectedMerge(ctx, p, target.HeadChangesetID, resultID, reviewer, principal.ID, lethe.StrategyMergeCommit); err != nil {
+			fresh, freshReviewer, err := s.requireCurrentApproval(ctx, p.ID, target.HeadChangesetID)
+			if err != nil {
+				return nil, err
+			}
+			p = fresh
+			if err := s.advanceProtectedMerge(ctx, p, target.HeadChangesetID, resultID, freshReviewer, principal.ID, lethe.StrategyMergeCommit); err != nil {
 				return nil, fmt.Errorf("reviewed merge failed: %w", err)
 			}
 			landed = true
@@ -1053,6 +1075,28 @@ func (s *Server) advanceProtectedMerge(ctx context.Context, p *proposal.Proposal
 		metrics.Inc(metrics.MergeCASConflicts)
 	}
 	return err
+}
+
+// requireCurrentApproval re-validates the independent approval against the
+// freshest proposal state immediately before a protected-ref advance. The
+// merge path mutates proposal state (persisting the merge result and conflict
+// snapshots) while concurrent reviewers may append objection findings, so the
+// approval computed at handler entry can be stale by the time the ref moves.
+// The envelope is signed only when the approval still holds; an objection or
+// terminal transition appended in the meantime aborts the merge.
+func (s *Server) requireCurrentApproval(ctx context.Context, proposalID, targetHeadChangesetID string) (*proposal.Proposal, string, error) {
+	fresh, err := s.proposalSvc.Get(ctx, proposalID)
+	if err != nil {
+		return nil, "", err
+	}
+	if fresh.Status != proposal.StatusPending {
+		return nil, "", fmt.Errorf("proposal is no longer pending (now %s); merge aborted", fresh.Status)
+	}
+	reviewer, approved := independentApprovalReviewer(fresh, targetHeadChangesetID)
+	if !approved {
+		return nil, "", fmt.Errorf("merge approval no longer valid for the target head; a concurrent review changed the outcome")
+	}
+	return fresh, reviewer, nil
 }
 
 func independentApprovalReviewer(p *proposal.Proposal, targetHeadChangesetID string) (string, bool) {
