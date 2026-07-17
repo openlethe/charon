@@ -161,9 +161,9 @@ func TestRepositoryOperationalScriptContracts(t *testing.T) {
 
 	rotation := read("scripts/rotate-tokens.sh")
 	for _, required := range []string{
-		"docker compose run --rm --no-deps --entrypoint charon charon",
 		"docker compose run --rm --no-deps --entrypoint charon charon-reviewer",
 		`awk '$3 == "active" {print $1}'`,
+		`"${reviewer_cli[@]}" obol mint`,
 	} {
 		if !strings.Contains(rotation, required) {
 			t.Fatalf("rotation script missing %q", required)
@@ -171,6 +171,9 @@ func TestRepositoryOperationalScriptContracts(t *testing.T) {
 	}
 	if strings.Contains(rotation, "/bin/charon") {
 		t.Fatal("rotation script must not target the host database through bin/charon")
+	}
+	if strings.Contains(rotation, `"${charon_cli[@]}" obol mint`) {
+		t.Fatal("rotation script must mint every role Obol with the reviewer (Obol) gateway audience")
 	}
 
 	start := read("start.sh")
@@ -193,10 +196,10 @@ func TestRepositoryOperationalScriptContracts(t *testing.T) {
 	}
 	setup := read("setup.sh")
 	if !strings.Contains(setup, "docker compose run --rm --no-deps --entrypoint charon charon-reviewer") ||
-		!strings.Contains(setup, `mint_to_file "$reviewer_id" "${secrets_dir}/reviewer-obol.txt" reviewer`) ||
+		!strings.Contains(setup, `"${reviewer_cli[@]}" obol mint`) ||
 		!strings.Contains(setup, `auth_mode=${CHARON_AUTH_MODE:-oauth}`) ||
 		!strings.Contains(setup, `bootstrap_default_user=${CHARON_OAUTH_DEFAULT_USER:-principal_bootstrap_placeholder}`) {
-		t.Fatal("setup script must align OAuth defaults and the reviewer Obol audience with the dual-gateway deployment")
+		t.Fatal("setup script must align OAuth defaults and mint all role Obols with the reviewer (Obol) gateway audience")
 	}
 
 	launcherPath := filepath.Join(repoRoot, "bin", "charon")
