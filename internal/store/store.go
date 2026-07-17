@@ -184,6 +184,12 @@ func (db *DB) migrate() error {
 		}
 	}
 
+	if currentVersion < 7 {
+		if err := db.migrateV7(); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -442,6 +448,39 @@ func (db *DB) migrateV6() error {
 		}
 	}
 	if err := recordMigration(ctx, tx, 6); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// migrateV7 adds process-instance ownership to the audit outbox. Charon
+// deployments can run sibling gateways against one database (Compose runs
+// author and reviewer profiles), so restart reconciliation must only retire
+// intents whose owning process is actually dead — never a live sibling's
+// in-flight intent. Instances heartbeat; intents stamp their owner.
+func (db *DB) migrateV7() error {
+	ctx := context.Background()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	statements := []string{
+		`CREATE TABLE charon_instances (
+			instance_id TEXT PRIMARY KEY,
+			started_at TEXT NOT NULL,
+			last_heartbeat TEXT NOT NULL
+		)`,
+		`ALTER TABLE audit_outbox ADD COLUMN owner_id TEXT`,
+	}
+
+	for _, stmt := range statements {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("migration v7: %w", err)
+		}
+	}
+	if err := recordMigration(ctx, tx, 7); err != nil {
 		return err
 	}
 	return tx.Commit()

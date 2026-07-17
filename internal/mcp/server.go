@@ -323,6 +323,9 @@ func (s *Server) handlePropose(ctx context.Context, request mcp.CallToolRequest)
 
 func (s *Server) handleCheckpoint(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	start := time.Now()
+	if err := s.requireMutationsEnabled(); err != nil {
+		return nil, err
+	}
 	principal := authFromContext(ctx)
 	reqID := requestIDFromContext(ctx)
 
@@ -455,6 +458,9 @@ func (s *Server) handleListProposals(ctx context.Context, request mcp.CallToolRe
 
 func (s *Server) handleWrite(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	start := time.Now()
+	if err := s.requireMutationsEnabled(); err != nil {
+		return nil, err
+	}
 	principal := authFromContext(ctx)
 	reqID := requestIDFromContext(ctx)
 

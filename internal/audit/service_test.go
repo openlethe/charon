@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/openlethe/charon/internal/store"
 )
@@ -112,7 +113,7 @@ func TestReconcileAfterRestart(t *testing.T) {
 	}
 	_ = third
 
-	reconciled, err := svc.ReconcileAfterRestart(ctx)
+	reconciled, err := svc.ReconcileAfterRestart(ctx, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,8 +128,55 @@ func TestReconcileAfterRestart(t *testing.T) {
 		t.Fatalf("ambiguous = %d, want 2", len(ambiguous))
 	}
 	// Reconciliation is idempotent.
-	reconciled, err = svc.ReconcileAfterRestart(ctx)
+	reconciled, err = svc.ReconcileAfterRestart(ctx, 0)
 	if err != nil || reconciled != 0 {
 		t.Fatalf("second reconcile = %d, %v", reconciled, err)
+	}
+}
+
+// A sibling gateway restarting must never retire a live sibling's in-flight
+// intents: reconciliation is ownership-aware.
+func TestReconcileSkipsLiveSiblings(t *testing.T) {
+	_, db := openAuditService(t)
+	ctx := context.Background()
+
+	// Live sibling instance with a fresh heartbeat.
+	sibling := NewService(db)
+	if _, err := sibling.RegisterInstance(ctx); err != nil {
+		t.Fatal(err)
+	}
+	live, err := sibling.BeginIntent(ctx, testIntent("memory_merge"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Intent from a dead/unregistered owner.
+	dead := NewService(db)
+	dead.ownerID = "dead-instance"
+	if _, err := dead.BeginIntent(ctx, testIntent("memory_merge")); err != nil {
+		t.Fatal(err)
+	}
+
+	// This process restarts and reconciles with a short TTL.
+	restarting := NewService(db)
+	if _, err := restarting.RegisterInstance(ctx); err != nil {
+		t.Fatal(err)
+	}
+	reconciled, err := restarting.ReconcileAfterRestart(ctx, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reconciled != 1 {
+		t.Fatalf("reconciled = %d, want exactly 1 (the dead owner)", reconciled)
+	}
+	entries, err := restarting.List(ctx, "ambiguous", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].IntentID == live.IntentID {
+		t.Fatalf("live sibling intent touched: %#v", entries)
+	}
+	// The live sibling can still complete its intent.
+	if err := sibling.Complete(ctx, live.IntentID, ""); err != nil {
+		t.Fatalf("live sibling completion failed: %v", err)
 	}
 }

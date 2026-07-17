@@ -53,10 +53,16 @@ func NewServer(cfg *config.Config, db *store.DB, logger *slog.Logger) (*Server, 
 	}
 	ledgerSvc.SetAnchorPath(cfg.LedgerAnchorPath)
 	auditSvc := audit.NewService(db)
-	if reconciled, err := auditSvc.ReconcileAfterRestart(context.Background()); err != nil {
+	if _, err := auditSvc.RegisterInstance(context.Background()); err != nil {
+		return nil, fmt.Errorf("audit instance registration: %w", err)
+	}
+	// Restart reconciliation is ownership-aware: only intents from dead
+	// instances are retired, so a sibling gateway's in-flight mutations are
+	// never mislabeled when this process restarts alongside it.
+	if reconciled, err := auditSvc.ReconcileAfterRestart(context.Background(), audit.IntentStaleAfter); err != nil {
 		return nil, fmt.Errorf("audit outbox reconciliation: %w", err)
 	} else if reconciled > 0 {
-		logger.Warn("audit intents from before the restart marked ambiguous; investigate before relying on affected resources",
+		logger.Warn("audit intents from dead instances marked ambiguous; investigate before relying on affected resources",
 			"reconciled", reconciled)
 	}
 	letheClient := lethe.NewClient(cfg.Upstream, cfg.LetheAPIKey, cfg.RequestTimeout, int64(cfg.MaxResultBytes))
@@ -192,6 +198,25 @@ func (s *Server) Start(ctx context.Context) error {
 		IdleTimeout:       30 * time.Second,
 		MaxHeaderBytes:    64 << 10,
 	}
+
+	// Keep this instance's audit ownership alive so sibling reconciliation
+	// never retires our in-flight intents.
+	go func() {
+		ticker := time.NewTicker(audit.HeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				hbCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				if err := s.auditSvc.Heartbeat(hbCtx); err != nil {
+					s.logger.Warn("audit ownership heartbeat failed", "error", sanitizeHealthError(err))
+				}
+				cancel()
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
 	errCh := make(chan error, 2)
 	go func() { errCh <- publicServer.Serve(publicListener) }()

@@ -10,6 +10,10 @@ services:
       CHARON_HTTP: :18484
       CHARON_ADMIN_HTTP: /tmp/charon-admin.sock
       CHARON_UPSTREAM: ${CHARON_UPSTREAM:-http://host.docker.internal:18485}
+      # host.docker.internal is the Docker Desktop same-host gateway; plaintext
+      # to it is a documented local development override (logged at startup).
+      # Production must use HTTPS, a Unix socket, or a loopback endpoint.
+      CHARON_ALLOW_INSECURE_UPSTREAM: ${CHARON_ALLOW_INSECURE_UPSTREAM:-1}
       CHARON_PUBLIC_URL: ${CHARON_PUBLIC_URL:?CHARON_PUBLIC_URL is required}
       LETHE_API_KEY: ${LETHE_API_KEY:?LETHE_API_KEY is required}
       # Migration fallback for existing installations. New deployments should
@@ -75,6 +79,9 @@ services:
       CHARON_HTTP: :18484
       CHARON_ADMIN_HTTP: /tmp/charon-admin.sock
       CHARON_UPSTREAM: ${CHARON_UPSTREAM:-http://host.docker.internal:18485}
+      # Docker Desktop same-host gateway: documented local dev override (see
+      # the author gateway service above).
+      CHARON_ALLOW_INSECURE_UPSTREAM: ${CHARON_ALLOW_INSECURE_UPSTREAM:-1}
       CHARON_PUBLIC_URL: ${CHARON_REVIEWER_PUBLIC_URL:-http://127.0.0.1:18486}
       LETHE_API_KEY: ${LETHE_API_KEY:?LETHE_API_KEY is required}
       CHARON_HMAC_KEY: ${CHARON_HMAC_KEY:-}

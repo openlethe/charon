@@ -39,13 +39,55 @@ type Intent struct {
 
 // Service persists audit intents and outcomes.
 type Service struct {
-	db *store.DB
+	db      *store.DB
+	ownerID string
 }
 
 // NewService creates an audit outbox service.
 func NewService(db *store.DB) *Service {
 	return &Service{db: db}
 }
+
+// RegisterInstance records this process as a live audit-intent owner. Charon
+// deployments can run sibling gateways against one database, so restart
+// reconciliation distinguishes live owners from dead ones by heartbeat.
+// Returns this instance's owner ID; call Heartbeat periodically afterwards.
+func (s *Service) RegisterInstance(ctx context.Context) (string, error) {
+	if s.ownerID != "" {
+		return s.ownerID, nil
+	}
+	s.ownerID = uuid.Must(uuid.NewV7()).String()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO charon_instances (instance_id, started_at, last_heartbeat)
+		VALUES (?, ?, ?)
+		ON CONFLICT(instance_id) DO UPDATE SET last_heartbeat = excluded.last_heartbeat
+	`, s.ownerID, now, now)
+	if err != nil {
+		return "", fmt.Errorf("register audit instance: %w", err)
+	}
+	return s.ownerID, nil
+}
+
+// Heartbeat proves this process is alive so reconciliation never retires its
+// in-flight intents. Best-effort: a failed heartbeat only matters if it keeps
+// failing past the staleness TTL.
+func (s *Service) Heartbeat(ctx context.Context) error {
+	if s.ownerID == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE charon_instances SET last_heartbeat = ? WHERE instance_id = ?
+	`, time.Now().UTC().Format(time.RFC3339Nano), s.ownerID)
+	return err
+}
+
+// heartbeatInterval is how often live instances should heartbeat; intents
+// whose owner has not heartbeated within intentStaleAfter are reconcilable.
+const (
+	HeartbeatInterval = 15 * time.Second
+	IntentStaleAfter  = 60 * time.Second
+)
 
 // BeginIntent durably records the intent to mutate. A failure means audit
 // persistence is unavailable and the caller MUST abort the mutation — this is
@@ -60,12 +102,12 @@ func (s *Service) BeginIntent(ctx context.Context, intent Intent) (*Intent, erro
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO audit_outbox (
 			intent_id, request_id, principal_id, operation, project_id,
-			request_digest, target_resource, intended_transition, status, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'intent', ?)
+			request_digest, target_resource, intended_transition, status, created_at, owner_id
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'intent', ?, ?)
 	`, intent.IntentID, intent.RequestID, intent.PrincipalID, intent.Operation,
 		nullEmpty(intent.ProjectID), nullEmpty(intent.RequestDigest),
 		nullEmpty(intent.TargetResource), nullEmpty(intent.IntendedTransition),
-		time.Now().UTC().Format(time.RFC3339Nano))
+		time.Now().UTC().Format(time.RFC3339Nano), nullEmpty(s.ownerID))
 	if err != nil {
 		return nil, fmt.Errorf("persist audit intent: %w", err)
 	}
@@ -103,15 +145,25 @@ func (s *Service) finish(ctx context.Context, intentID string, status IntentStat
 	return nil
 }
 
-// ReconcileAfterRestart marks every intent that never recorded an outcome as
-// ambiguous — the process died between intent and completion, so the true
-// outcome is unknown and must be investigated. Returns the number reconciled.
-func (s *Service) ReconcileAfterRestart(ctx context.Context) (int, error) {
+// ReconcileAfterRestart marks intents from DEAD owners as ambiguous — the
+// owning process died between intent and completion, so the true outcome is
+// unknown and must be investigated. Intents from live siblings (heartbeat
+// fresher than staleAfter) are never touched; pre-ownership (NULL owner)
+// intents come from processes that predate leases and are always reconciled.
+// Returns the number reconciled.
+func (s *Service) ReconcileAfterRestart(ctx context.Context, staleAfter time.Duration) (int, error) {
+	if staleAfter <= 0 {
+		staleAfter = IntentStaleAfter
+	}
+	cutoff := time.Now().UTC().Add(-staleAfter).Format(time.RFC3339Nano)
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE audit_outbox SET status = 'ambiguous',
 			detail = COALESCE(detail, '') || 'reconciled after restart: outcome unknown'
-		WHERE status = 'intent'
-	`)
+		WHERE status = 'intent' AND (
+			owner_id IS NULL OR owner_id = '' OR
+			owner_id NOT IN (SELECT instance_id FROM charon_instances WHERE last_heartbeat > ?)
+		)
+	`, cutoff)
 	if err != nil {
 		return 0, fmt.Errorf("reconcile audit outbox: %w", err)
 	}
