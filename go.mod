@@ -3,14 +3,14 @@ module github.com/openlethe/charon
 go 1.25.12
 
 require (
+	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/uuid v1.6.0
-	github.com/mark3labs/mcp-go v0.56.0
+	github.com/mark3labs/mcp-go v0.58.0
 	modernc.org/sqlite v1.34.4
 )
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
-	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
 	github.com/google/jsonschema-go v0.4.2 // indirect
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
